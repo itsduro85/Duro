@@ -60,6 +60,15 @@ const activeChannels = new Set(
 // Short conversation memory per channel
 const channelHistory = new Map();
 
+// Model chosen per channel with /duro-models (channels without a choice use the default MODEL_CHAIN)
+const channelModels = new Map();
+
+// Personal model chosen by each user with /my-duro-models (works in every AI channel, beats the channel model)
+const userModels = new Map();
+
+// Cached list of models your API key can use (refreshed every 10 minutes)
+let modelListCache = { fetchedAt: 0, models: [] };
+
 // ---------------------------------------------------------------------------
 // Tiny web server so Render sees an open port
 // ---------------------------------------------------------------------------
@@ -98,6 +107,39 @@ class GeminiError extends Error {
         this.name = 'GeminiError';
         this.status = status;
     }
+}
+
+// Ask Google which text models this API key can actually use
+async function getAvailableModels() {
+    const cacheIsFresh = Date.now() - modelListCache.fetchedAt < 10 * 60 * 1000;
+    if (cacheIsFresh && modelListCache.models.length) return modelListCache.models;
+
+    const models = [];
+    let pageToken = '';
+
+    do {
+        const url = `${GEMINI_BASE_URL}?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+        const res = await fetch(url, {
+            headers: { 'x-goog-api-key': GEMINI_API_KEY },
+            signal: AbortSignal.timeout(15_000)
+        });
+        if (!res.ok) throw new GeminiError(`ListModels failed (HTTP ${res.status})`, res.status);
+
+        const data = await res.json();
+        for (const m of data.models || []) {
+            const id = m.name.replace(/^models\//, '');
+            if (!m.supportedGenerationMethods?.includes('generateContent')) continue;
+            if (!id.startsWith('gemini')) continue;
+            // Skip models that don't do normal text chat (image, voice, embeddings, live audio, etc.)
+            if (/image|tts|embed|live|audio|robotics|computer-use|aqa/i.test(id)) continue;
+            models.push({ id, displayName: m.displayName || id });
+        }
+        pageToken = data.nextPageToken || '';
+    } while (pageToken);
+
+    models.sort((a, b) => a.id.localeCompare(b.id));
+    modelListCache = { fetchedAt: Date.now(), models };
+    return models;
 }
 
 // Split long text into Discord-sized pieces, preferring line/word boundaries
@@ -178,10 +220,17 @@ async function requestGemini(model, contents, withSearch) {
 }
 
 // Tries search first, then no search, then the fallback model
-async function askGemini(contents) {
+async function askGemini(contents, channelId, userId) {
     let lastError;
 
-    for (const model of MODEL_CHAIN) {
+    // Priority: the user's personal model, then the channel model, then the default models as backups
+    const modelsToTry = [...new Set([
+        userModels.get(userId),
+        channelModels.get(channelId),
+        ...MODEL_CHAIN
+    ].filter(Boolean))];
+
+    for (const model of modelsToTry) {
         const attempts = USE_SEARCH ? [true, false] : [false];
 
         for (const withSearch of attempts) {
@@ -259,7 +308,27 @@ client.once(Events.ClientReady, async () => {
         new SlashCommandBuilder()
             .setName('reset-ai-memory')
             .setDescription('Make Duro forget the recent conversation in this channel.')
-            .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
+            .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
+        new SlashCommandBuilder()
+            .setName('duro-models')
+            .setDescription('Admins only: set the default Gemini model for this channel.')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+            .addStringOption(option =>
+                option
+                    .setName('model')
+                    .setDescription('Type to search the models your API key can use (leave empty to see the current one)')
+                    .setAutocomplete(true)
+            ),
+        // No permission restriction here: every member can use it
+        new SlashCommandBuilder()
+            .setName('my-duro-models')
+            .setDescription('Choose your own personal Gemini model for your messages to Duro.')
+            .addStringOption(option =>
+                option
+                    .setName('model')
+                    .setDescription('Type to search the models available (leave empty to see your current one)')
+                    .setAutocomplete(true)
+            )
     ].map(command => command.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
@@ -274,6 +343,29 @@ client.once(Events.ClientReady, async () => {
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+    // The dropdown/search box for /duro-models: Discord asks for matching models while you type
+    if (interaction.isAutocomplete()) {
+        try {
+            const typed = interaction.options.getFocused().toLowerCase();
+            const models = await getAvailableModels();
+
+            const defaultLabel = interaction.commandName === 'my-duro-models'
+                ? "Default (use this channel's model)"
+                : `Default (${MODEL_CHAIN[0]})`;
+
+            const choices = [{ name: defaultLabel, value: 'default' }]
+                .concat(models.map(m => ({ name: `${m.displayName} (${m.id})`.slice(0, 100), value: m.id })))
+                .filter(choice => choice.name.toLowerCase().includes(typed) || choice.value.includes(typed))
+                .slice(0, 25); // Discord allows at most 25 suggestions
+
+            await interaction.respond(choices);
+        } catch (error) {
+            console.error('Autocomplete error:', error.message);
+            await interaction.respond([]).catch(() => {});
+        }
+        return;
+    }
+
     if (!interaction.isChatInputCommand()) return;
 
     try {
@@ -282,8 +374,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
             return;
         }
 
-        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageChannels)) {
-            await interaction.reply({ content: '🚫 You need the **Manage Channels** permission to use this command.', flags: MessageFlags.Ephemeral });
+        // Each command has its own required permission (my-duro-models is open to everyone)
+        const requiredPermission = {
+            'set-ai-channel': PermissionFlagsBits.ManageChannels,
+            'remove-ai-channel': PermissionFlagsBits.ManageChannels,
+            'reset-ai-memory': PermissionFlagsBits.ManageChannels,
+            'duro-models': PermissionFlagsBits.Administrator
+        }[interaction.commandName];
+
+        if (requiredPermission && !interaction.memberPermissions?.has(requiredPermission)) {
+            const who = requiredPermission === PermissionFlagsBits.Administrator ? '**Administrator**' : '**Manage Channels**';
+            await interaction.reply({ content: `🚫 You need the ${who} permission to use this command.`, flags: MessageFlags.Ephemeral });
             return;
         }
 
@@ -308,6 +409,91 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 channelHistory.delete(channelId);
                 await interaction.reply('🧹 Memory cleared for this channel.');
                 break;
+
+            case 'duro-models': {
+                if (!activeChannels.has(channelId)) {
+                    await interaction.reply({ content: '⚠️ Run `/set-ai-channel` in this channel first, then pick a model.', flags: MessageFlags.Ephemeral });
+                    break;
+                }
+
+                const chosen = interaction.options.getString('model');
+                const current = channelModels.get(channelId) || MODEL_CHAIN[0];
+
+                // No option given: just show the current model
+                if (!chosen) {
+                    await interaction.reply({
+                        content: `🧠 Current model for this channel: \`${current}\`\nUse \`/duro-models\` and pick from the list to change it.`,
+                        flags: MessageFlags.Ephemeral
+                    });
+                    break;
+                }
+
+                if (chosen === 'default') {
+                    channelModels.delete(channelId);
+                    await interaction.reply(`🔄 This channel is back on the default model: \`${MODEL_CHAIN[0]}\`.`);
+                    break;
+                }
+
+                await interaction.deferReply();
+
+                // Make sure the typed name really exists on this API key
+                let models = [];
+                try {
+                    models = await getAvailableModels();
+                } catch (error) {
+                    console.error('Could not verify model list:', error.message);
+                }
+
+                if (models.length && !models.some(m => m.id === chosen)) {
+                    await interaction.editReply(`❌ \`${chosen}\` isn't available on my API key. Pick one from the suggestion list.`);
+                    break;
+                }
+
+                channelModels.set(channelId, chosen);
+                await interaction.editReply(`✅ This channel's default model is now \`${chosen}\`. Members who picked their own with \`/my-duro-models\` keep theirs. If a model fails or hits a quota, I'll fall back to the default models.`);
+                break;
+            }
+
+            case 'my-duro-models': {
+                const chosen = interaction.options.getString('model');
+                const personal = userModels.get(interaction.user.id);
+                const channelDefault = channelModels.get(channelId) || MODEL_CHAIN[0];
+
+                // No option given: show which model is used for this person
+                if (!chosen) {
+                    await interaction.reply({
+                        content: personal
+                            ? `🧠 Your personal model: \`${personal}\`\nUse \`/my-duro-models\` and pick from the list to change it, or choose **Default** to go back to the channel's model.`
+                            : `🧠 You have no personal model, so I use this channel's model: \`${channelDefault}\`\nUse \`/my-duro-models\` and pick from the list to choose your own.`,
+                        flags: MessageFlags.Ephemeral
+                    });
+                    break;
+                }
+
+                if (chosen === 'default') {
+                    userModels.delete(interaction.user.id);
+                    await interaction.reply({ content: `🔄 Your personal model is removed. I'll use the channel's model: \`${channelDefault}\`.`, flags: MessageFlags.Ephemeral });
+                    break;
+                }
+
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+                let models = [];
+                try {
+                    models = await getAvailableModels();
+                } catch (error) {
+                    console.error('Could not verify model list:', error.message);
+                }
+
+                if (models.length && !models.some(m => m.id === chosen)) {
+                    await interaction.editReply(`❌ \`${chosen}\` isn't available on my API key. Pick one from the suggestion list.`);
+                    break;
+                }
+
+                userModels.set(interaction.user.id, chosen);
+                await interaction.editReply(`✅ Your messages to Duro now use \`${chosen}\`, in every AI channel. If it fails or hits a quota, I'll fall back to the channel's model.`);
+                break;
+            }
         }
     } catch (error) {
         console.error('Interaction error:', error);
@@ -340,7 +526,7 @@ client.on(Events.MessageCreate, async (message) => {
             { role: 'user', parts: [{ text: promptText }, ...imageParts] }
         ];
 
-        let answer = await askGemini(contents);
+        let answer = await askGemini(contents, message.channel.id, message.author.id);
 
         // Safety net: remove a leading "Name:" if the model still copies the prefix
         const prefix = `${author}:`;
