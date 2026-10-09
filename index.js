@@ -69,6 +69,11 @@ const userModels = new Map();
 // Cached list of models your API key can use (refreshed every 10 minutes)
 let modelListCache = { fetchedAt: 0, models: [] };
 
+// Google Search has its own, much smaller quota. When it runs out, skip search for a while
+// so every message doesn't waste time (and quota) on requests that are certain to fail.
+const SEARCH_COOLDOWN_MS = 30 * 60 * 1000;
+let searchBlockedUntil = 0;
+
 // ---------------------------------------------------------------------------
 // Tiny web server so Render sees an open port
 // ---------------------------------------------------------------------------
@@ -91,15 +96,18 @@ const getCurrentDateTimeString = () =>
         timeZone: 'UTC'
     }) + ' UTC';
 
-const buildSystemInstruction = () =>
+// Only mention Google Search when the search tool is really attached to the request.
+// (Telling a model to search when it has no search tool makes it fail with MALFORMED_FUNCTION_CALL.)
+const buildSystemInstruction = (withSearch) =>
     `You are Duro, a helpful AI assistant for the ChaosBoys Discord server. ` +
     `Keep your answers brief, simple, and direct. Use plain Discord-friendly formatting. ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
     `but NEVER start your own reply with a name or "Name:", just answer directly. ` +
-    `Always use Google Search for questions about current facts, numbers, rankings, news, or anything that changes over time. ` +
     `The current date and time is ${getCurrentDateTimeString()}. ` +
-    `For anything that may have changed recently (news, subscriber counts, prices, scores, releases), ` +
-    `rely on search results when available instead of memory, and say if you are unsure.`;
+    (withSearch
+        ? `Use Google Search for questions about current facts, numbers, rankings, news, or anything that changes over time. `
+        : `You cannot search the internet right now. For anything that may have changed recently ` +
+          `(news, subscriber counts, prices, scores, releases), give your best knowledge and clearly say it may be outdated. `);
 
 class GeminiError extends Error {
     constructor(message, status) {
@@ -185,7 +193,7 @@ async function buildImageParts(message) {
 // One request to the Gemini API for a specific model
 async function requestGemini(model, contents, withSearch) {
     const body = {
-        systemInstruction: { parts: [{ text: buildSystemInstruction() }] },
+        systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch) }] },
         contents,
         generationConfig: {
             temperature: 0.7,
@@ -231,7 +239,8 @@ async function askGemini(contents, channelId, userId) {
     ].filter(Boolean))];
 
     for (const model of modelsToTry) {
-        const attempts = USE_SEARCH ? [true, false] : [false];
+        const searchAllowed = USE_SEARCH && Date.now() >= searchBlockedUntil;
+        const attempts = searchAllowed ? [true, false] : [false];
 
         for (const withSearch of attempts) {
             try {
@@ -261,6 +270,14 @@ async function askGemini(contents, channelId, userId) {
             } catch (err) {
                 lastError = err;
                 console.error(`Gemini error [model=${model}, search=${withSearch}]:`, err.message);
+
+                // Search quota used up: stop asking for search for a while
+                if (withSearch && err.status === 429) {
+                    searchBlockedUntil = Date.now() + SEARCH_COOLDOWN_MS;
+                    console.warn('Search quota reached, answering without Google Search for the next 30 minutes.');
+                }
+                // Google is overloaded (HTTP 500/503): short pause before trying the next option
+                if (err.status === 500 || err.status === 503) await new Promise(resolve => setTimeout(resolve, 1500));
 
                 // A rejected API key will not be fixed by retrying with another model
                 // (a 403 while search is on may just mean search isn't allowed, so that one retries without search first)
