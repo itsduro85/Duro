@@ -207,9 +207,10 @@ async function askGemini(contents) {
                 lastError = err;
                 console.error(`Gemini error [model=${model}, search=${withSearch}]:`, err.message);
 
-                // Rate limit or bad key will not be fixed by retrying with another model
+                // A rejected API key will not be fixed by retrying with another model
                 // (a 403 while search is on may just mean search isn't allowed, so that one retries without search first)
-                if (err.status === 429 || err.status === 401 || (err.status === 403 && !withSearch)) throw err;
+                // A 429 (quota) is NOT fatal: search and each model have separate quotas, so keep trying the next option
+                if (err.status === 401 || (err.status === 403 && !withSearch)) throw err;
                 // Otherwise: retry without search, then with the next model
             }
         }
