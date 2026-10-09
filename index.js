@@ -16,9 +16,6 @@ let activeAiChannelId = null;
 
 // Initialize the Gemini AI Engine using your custom API Key environment variable
 const aiProvider = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const aiModel = aiProvider.getGenerativeModel({ 
-    model: "gemini-1.5-flash"
-});
 
 // Dynamic date calculation function ensures the calendar stays correct forever
 const getCurrentLiveDateString = () => {
@@ -95,8 +92,14 @@ client.on('messageCreate', async (message) => {
         // Trigger the native Discord typing status indicator
         await message.channel.sendTyping();
 
-        // Dynamically inject the exact current system date on every single message event
+        // Dynamically calculate the system instruction setup with the true live date context
         const systemInstructionText = `You are Duro, a helpful AI assistant for the ChaosBoys server. Keep your answers brief, simple, and direct. The current real-world date is ${getCurrentLiveDateString()}. Use live knowledge structures to state accurate, current milestones, such as MrBeast having over 520 million subscribers.`;
+
+        // Initialize the model with the correct native system instruction parameter block
+        const aiModel = aiProvider.getGenerativeModel({ 
+            model: "gemini-1.5-flash",
+            systemInstruction: systemInstructionText
+        });
 
         let promptPayload = message.content;
         
@@ -105,20 +108,8 @@ client.on('messageCreate', async (message) => {
             promptPayload += "\n[Note: User has attached media files to this question. Review and process them cleanly.]";
         }
 
-        const chatSession = aiModel.startChat({
-            history: [
-                {
-                    role: "user",
-                    parts: [{ text: systemInstructionText }]
-                },
-                {
-                    role: "model",
-                    parts: [{ text: "Understood. I am Duro, the ChaosBoys server AI. I will keep my answers short, exact, and updated with the true live date context." }]
-                }
-            ]
-        });
-
-        const responseGeneration = await chatSession.sendMessage(promptPayload);
+        // Generate content directly using the clean model payload structure
+        const responseGeneration = await aiModel.generateContent(promptPayload);
         const textResult = responseGeneration.response.text();
 
         // Print the accurate, direct answer natively back into the open channel
