@@ -112,7 +112,7 @@ client.on('messageCreate', async (message) => {
 
         const dataResult = await apiResponse.json();
         
-        // Extract the raw text result from the API JSON layout safely
+        // FIXED SYNTAX: Safely extract the text result from the API response object
         const aiTextOutput = dataResult.candidates?.[0]?.content?.parts?.[0]?.text;
 
         if (aiTextOutput) {
