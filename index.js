@@ -85,7 +85,9 @@ const getCurrentDateTimeString = () =>
 const buildSystemInstruction = () =>
     `You are Duro, a helpful AI assistant for the ChaosBoys Discord server. ` +
     `Keep your answers brief, simple, and direct. Use plain Discord-friendly formatting. ` +
-    `Messages from users are prefixed with their display name. ` +
+    `Messages from users are prefixed with their display name so you know who is talking, ` +
+    `but NEVER start your own reply with a name or "Name:", just answer directly. ` +
+    `Always use Google Search for questions about current facts, numbers, rankings, news, or anything that changes over time. ` +
     `The current date and time is ${getCurrentDateTimeString()}. ` +
     `For anything that may have changed recently (news, subscriber counts, prices, scores, releases), ` +
     `rely on search results when available instead of memory, and say if you are unsure.`;
@@ -197,7 +199,11 @@ async function askGemini(contents) {
                     .join('')
                     .trim();
 
-                if (text) return text;
+                if (text) {
+                    // Diagnostic: shows in Render logs whether Google Search was really used for this answer
+                    console.log(`Answered with model=${model}, searchRequested=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}`);
+                    return text;
+                }
 
                 if (candidate?.finishReason === 'SAFETY') {
                     return "⚠️ I can't answer that one (it was blocked by safety filters).";
@@ -334,7 +340,11 @@ client.on(Events.MessageCreate, async (message) => {
             { role: 'user', parts: [{ text: promptText }, ...imageParts] }
         ];
 
-        const answer = await askGemini(contents);
+        let answer = await askGemini(contents);
+
+        // Safety net: remove a leading "Name:" if the model still copies the prefix
+        const prefix = `${author}:`;
+        if (answer.startsWith(prefix)) answer = answer.slice(prefix.length).trim();
 
         // Only remember the exchange if it worked
         addToHistory(message.channel.id, 'user', imageParts.length ? `${promptText} [attached ${imageParts.length} image(s)]` : promptText);
