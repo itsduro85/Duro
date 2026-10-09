@@ -1,0 +1,14 @@
+{
+  "name": "Duro",
+  "version": "1.0.0",
+  "description": "Discord Gemini AI Bot hosted on Render",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "@google/generative-ai": "^0.2.1"
+  }
+}
