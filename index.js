@@ -96,8 +96,11 @@ client.on('messageCreate', async (message) => {
             userPrompt += "\n[Note: User has attached media files to this question. Review and process them cleanly.]";
         }
 
-        // FIXED BACKTICK STRINGS: Evaluates the environmental variables perfectly into a valid URL pathway
-                        const apiEndpoint = "https://googleapis.com" + process.env.GEMINI_API_KEY;
+        // BROKEN DOWN URL STRUCT: Split into three short lines so it never cuts off on screens again!
+        const baseHost = "https://googleapis.com";
+        const modelRoute = "/v1beta/models/gemini-1.5-flash:generateContent?key=";
+        const apiEndpoint = baseHost + modelRoute + process.env.GEMINI_API_KEY;
+        
         const requestPayload = {
             contents: [{ parts: [{ text: userPrompt }] }],
             systemInstruction: { parts: [{ text: systemInstructionText }] }
@@ -112,9 +115,8 @@ client.on('messageCreate', async (message) => {
         const dataResult = await apiResponse.json();
         
         // Safely extract the text result from the API response candidate array map
-        const aiTextOutput = dataResult.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (aiTextOutput) {
+        if (dataResult.candidates && dataResult.candidates[0] && dataResult.candidates[0].content && dataResult.candidates[0].content.parts && dataResult.candidates[0].content.parts[0]) {
+            const aiTextOutput = dataResult.candidates[0].content.parts[0].text;
             await message.reply(aiTextOutput);
         } else {
             console.error("API Error Object:", dataResult);
