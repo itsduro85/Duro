@@ -1,5 +1,5 @@
 import { Client, GatewayIntentBits } from 'discord.js';
-import { GoogleGenAI } from '@google/generative-ai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
 // Initialize the Discord Client with explicit intents to read messages and text data
 const client = new Client({
@@ -11,7 +11,7 @@ const client = new Client({
 });
 
 // Initialize the Gemini AI Engine using your custom API Key environment variable
-const aiProvider = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const aiProvider = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = aiProvider.getGenerativeModel({ 
     model: "gemini-1.5-flash"
 });
