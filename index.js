@@ -1,5 +1,4 @@
 import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import http from 'http';
 
 // Initialize the Discord Client with explicit intents to read messages and text data
@@ -13,9 +12,6 @@ const client = new Client({
 
 // Store the active AI channel ID in memory (starts empty)
 let activeAiChannelId = null;
-
-// Initialize the Gemini AI Engine using your custom API Key environment variable
-const aiProvider = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Dynamic date calculation function ensures the calendar stays correct forever
 const getCurrentLiveDateString = () => {
@@ -92,28 +88,39 @@ client.on('messageCreate', async (message) => {
         // Trigger the native Discord typing status indicator
         await message.channel.sendTyping();
 
-        // Dynamically calculate the system instruction setup with the true live date context
+        // System prompt instruction forces dynamic live 2026 dates and brief answers
         const systemInstructionText = `You are Duro, a helpful AI assistant for the ChaosBoys server. Keep your answers brief, simple, and direct. The current real-world date is ${getCurrentLiveDateString()}. Use live knowledge structures to state accurate, current milestones, such as MrBeast having over 520 million subscribers.`;
 
-        // Initialize the model with the correct native system instruction parameter block
-        const aiModel = aiProvider.getGenerativeModel({ 
-            model: "gemini-1.5-flash",
-            systemInstruction: systemInstructionText
-        });
-
-        let promptPayload = message.content;
-        
-        // Checks for attached images, screenshots, or documents natively in the open chat
+        let userPrompt = message.content;
         if (message.attachments.size > 0) {
-            promptPayload += "\n[Note: User has attached media files to this question. Review and process them cleanly.]";
+            userPrompt += "\n[Note: User has attached media files to this question. Review and process them cleanly.]";
         }
 
-        // Generate content directly using the clean model payload structure
-        const responseGeneration = await aiModel.generateContent(promptPayload);
-        const textResult = responseGeneration.response.text();
+        // Build a direct, lightweight raw web request payload for Gemini API
+        const apiEndpoint = `https://googleapis.com{process.env.GEMINI_API_KEY}`;
+        
+        const requestPayload = {
+            contents: [{ parts: [{ text: userPrompt }] }],
+            systemInstruction: { parts: [{ text: systemInstructionText }] }
+        };
 
-        // Print the accurate, direct answer natively back into the open channel
-        await message.reply(textResult);
+        const apiResponse = await fetch(apiEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestPayload)
+        });
+
+        const dataResult = await apiResponse.json();
+        
+        // Extract the raw text result from the API JSON layout safely
+        const aiTextOutput = dataResult.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (aiTextOutput) {
+            await message.reply(aiTextOutput);
+        } else {
+            console.error("API Error Object:", dataResult);
+            await message.reply("⚠️ Duro encountered an internal layout error processing this question.");
+        }
 
     } catch (networkError) {
         console.error("Gateway Exception:", networkError);
