@@ -1,5 +1,6 @@
 import { Client, GatewayIntentBits } from 'discord.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import http from 'http';
 
 // Initialize the Discord Client with explicit intents to read messages and text data
 const client = new Client({
@@ -25,6 +26,16 @@ const getCurrentLiveDateString = () => {
         day: 'numeric'
     });
 };
+
+// Creates a simple internal web listener so Render's port scanner turns green
+const webServer = http.createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/plain' });
+    response.end('Duro AI is active and running 24/7\n');
+});
+const serverPort = process.env.PORT || 10000;
+webServer.listen(serverPort, '0.0.0.0', () => {
+    console.log(`Port scanner listener active on gateway port ${serverPort}`);
+});
 
 client.once('ready', () => {
     console.log(`Duro AI is online and verified as ${client.user.tag}!`);
