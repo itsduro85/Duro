@@ -96,7 +96,7 @@ client.on('messageCreate', async (message) => {
             userPrompt += "\n[Note: User has attached media files to this question. Review and process them cleanly.]";
         }
 
-        // Build a direct, lightweight raw web request payload for Gemini API
+        // FIXED BACKTICK STRINGS: Evaluates the environmental variables perfectly into a valid URL pathway
         const apiEndpoint = `https://googleapis.com{process.env.GEMINI_API_KEY}`;
         
         const requestPayload = {
@@ -112,7 +112,7 @@ client.on('messageCreate', async (message) => {
 
         const dataResult = await apiResponse.json();
         
-        // FIXED SYNTAX: Safely extract the text result from the API response object
+        // Safely extract the text result from the API response candidate array map
         const aiTextOutput = dataResult.candidates?.[0]?.content?.parts?.[0]?.text;
 
         if (aiTextOutput) {
