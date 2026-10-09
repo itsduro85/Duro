@@ -97,8 +97,7 @@ client.on('messageCreate', async (message) => {
         }
 
         // FIXED BACKTICK STRINGS: Evaluates the environmental variables perfectly into a valid URL pathway
-        const apiEndpoint = `https://googleapis.com{process.env.GEMINI_API_KEY}`;
-        
+                        const apiEndpoint = "https://googleapis.com" + process.env.GEMINI_API_KEY;
         const requestPayload = {
             contents: [{ parts: [{ text: userPrompt }] }],
             systemInstruction: { parts: [{ text: systemInstructionText }] }
