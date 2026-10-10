@@ -75,6 +75,10 @@ const channelModels = new Map();
 // Personal model chosen by each user with /my-duro-models (works in every AI channel, beats the channel model)
 const userModels = new Map();
 
+// Small cooldown for /ask-duro so nobody burns the free quota by accident
+const ASK_COOLDOWN_MS = 5000;
+const askCooldowns = new Map();
+
 // Cached list of models your API key can use (refreshed every 10 minutes)
 let modelListCache = { fetchedAt: 0, models: [] };
 
@@ -384,6 +388,34 @@ function addToHistory(channelId, role, text) {
     channelHistory.set(channelId, history);
 }
 
+// Shared by normal chat messages and /ask-duro: builds the prompt, looks things up on the web if needed,
+// asks Gemini, remembers the exchange, and returns the final answer text
+async function generateAnswer({ channelId, userId, author, userText, imageParts = [] }) {
+    const promptText = `${author}: ${userText}`;
+    const history = channelHistory.get(channelId) ?? [];
+
+    // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
+    const webResults = await getWebResults(userText, history);
+
+    const userParts = [{ text: promptText }];
+    if (webResults) userParts.push({ text: webResults });
+    userParts.push(...imageParts);
+
+    const contents = [...history, { role: 'user', parts: userParts }];
+
+    let answer = await askGemini(contents, channelId, userId, Boolean(webResults));
+
+    // Safety net: remove a leading "Name:" if the model still copies the prefix
+    const prefix = `${author}:`;
+    if (answer.startsWith(prefix)) answer = answer.slice(prefix.length).trim();
+
+    // Only remember the exchange if it worked
+    addToHistory(channelId, 'user', imageParts.length ? `${promptText} [attached ${imageParts.length} image(s)]` : promptText);
+    addToHistory(channelId, 'model', answer);
+
+    return answer;
+}
+
 // ---------------------------------------------------------------------------
 // Slash commands
 // ---------------------------------------------------------------------------
@@ -422,6 +454,18 @@ client.once(Events.ClientReady, async () => {
                     .setName('model')
                     .setDescription('Type to search the models available (leave empty to see your current one)')
                     .setAutocomplete(true)
+            ),
+        // Open to everyone: ask Duro something in ANY server channel (not in DMs), even if it isn't an AI channel
+        new SlashCommandBuilder()
+            .setName('ask-duro')
+            .setDescription('Ask Duro a question in any channel.')
+            .setDMPermission(false)
+            .addStringOption(option =>
+                option
+                    .setName('message')
+                    .setDescription('What do you want to ask Duro?')
+                    .setRequired(true)
+                    .setMaxLength(1000)
             )
     ].map(command => command.toJSON());
 
@@ -548,6 +592,44 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 break;
             }
 
+            case 'ask-duro': {
+                const userText = interaction.options.getString('message', true).trim();
+                if (!userText) {
+                    await interaction.reply({ content: '⚠️ Type a question after `/ask-duro`.', flags: MessageFlags.Ephemeral });
+                    break;
+                }
+
+                const waitMs = ASK_COOLDOWN_MS - (Date.now() - (askCooldowns.get(interaction.user.id) ?? 0));
+                if (waitMs > 0) {
+                    await interaction.reply({ content: `⏳ Please wait ${Math.ceil(waitMs / 1000)} more second(s) before asking again.`, flags: MessageFlags.Ephemeral });
+                    break;
+                }
+                askCooldowns.set(interaction.user.id, Date.now());
+
+                // Thinking can take longer than Discord's 3-second limit, so acknowledge right away
+                await interaction.deferReply();
+                const safeMentions = { parse: [] };
+
+                try {
+                    const answer = await generateAnswer({
+                        channelId,
+                        userId: interaction.user.id,
+                        author: interaction.member?.displayName || interaction.user.username,
+                        userText
+                    });
+
+                    const chunks = splitMessage(answer);
+                    await interaction.editReply({ content: chunks[0], allowedMentions: safeMentions });
+                    for (const chunk of chunks.slice(1)) {
+                        await interaction.followUp({ content: chunk, allowedMentions: safeMentions });
+                    }
+                } catch (error) {
+                    console.error('/ask-duro error:', error);
+                    await interaction.editReply({ content: friendlyErrorMessage(error), allowedMentions: safeMentions }).catch(() => {});
+                }
+                break;
+            }
+
             case 'my-duro-models': {
                 const chosen = interaction.options.getString('model');
                 const personal = userModels.get(interaction.user.id);
@@ -595,6 +677,74 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ---------------------------------------------------------------------------
+// Spam and nonsense filter (for normal chat in AI channels; /ask-duro is always answered)
+// ---------------------------------------------------------------------------
+const SPAM_WINDOW_MS = 30_000;        // look at the last 30 seconds of a person's messages
+const SPAM_MAX_MESSAGES = 5;          // more than this many in the window = flooding
+const DUPLICATE_WINDOW_MS = 60_000;   // the exact same text again within a minute is ignored
+
+// Words that carry no question or meaning by themselves (add your own, lowercase)
+const FILLER_WORDS = new Set([
+    'ok', 'okay', 'k', 'kk', 'hm', 'hmm', 'hmmm', 'mm', 'mmm', 'lol', 'lmao', 'lmfao', 'rofl',
+    'xd', 'uh', 'um', 'ah', 'oh', 'ohh', 'bruh', 'bro'
+]);
+// Rows of the keyboard, like someone mashing keys
+const KEYBOARD_MASH = /asdf|sdfg|dfgh|fghj|ghjk|hjkl|qwer|uiop|zxcv|xcvb|cvbn|vbnm/i;
+
+const recentMessageTimes = new Map();  // userId -> timestamps of their latest messages
+const lastMessageByUser = new Map();   // userId -> { text, time } of their previous message
+const usersBeingAnswered = new Set();  // people Duro is answering right now (their extra messages are ignored)
+
+// Returns a short reason if the text means nothing, or null if it looks like a real message
+function nonsenseReason(rawText) {
+    // Remove parts that carry no meaning on their own: custom emoji, mentions and links
+    const cleaned = rawText
+        .replace(/<a?:\w+:\d+>/g, ' ')
+        .replace(/<[@#&!]+\d+>/g, ' ')
+        .replace(/https?:\/\/\S+/gi, ' ')
+        .trim();
+
+    if (!/[\p{L}\p{N}]/u.test(cleaned)) return 'no real words (emoji, symbols or links only)';
+
+    const tokens = cleaned.toLowerCase().split(/\s+/).map(t => t.replace(/[^\p{L}\p{M}\p{N}]/gu, '')).filter(Boolean);
+    const compact = tokens.join('');
+
+    if (compact.length < 2) return 'too short to mean anything';
+    if (compact.length >= 4 && /^(.+?)\1+$/u.test(compact)) return 'the same thing repeated';
+    if (tokens.every(token => FILLER_WORDS.has(token))) return 'filler words only';
+    if (tokens.some(token => token.length >= 5 && KEYBOARD_MASH.test(token))) return 'keyboard mashing';
+    if (tokens.some(token => /^[a-z]{7,}$/.test(token) && !/[aeiouy]/.test(token))) return 'random letters';
+    return null;
+}
+
+// Decides if Duro should stay silent for this message (returns the reason, or null to answer it)
+function shouldIgnoreMessage(message, hasImages) {
+    const userId = message.author.id;
+    const now = Date.now();
+    const text = message.content.trim();
+
+    // Flooding: too many messages in a short time
+    const times = (recentMessageTimes.get(userId) ?? []).filter(time => now - time < SPAM_WINDOW_MS);
+    times.push(now);
+    recentMessageTimes.set(userId, times);
+    if (times.length > SPAM_MAX_MESSAGES) return 'flooding (too many messages too fast)';
+
+    // Duro is already busy answering this person: don't pile up requests
+    if (usersBeingAnswered.has(userId)) return 'still answering this person';
+
+    // The exact same message again
+    const previous = lastMessageByUser.get(userId);
+    lastMessageByUser.set(userId, { text: text.toLowerCase(), time: now });
+    if (text && previous && previous.text === text.toLowerCase() && now - previous.time < DUPLICATE_WINDOW_MS) {
+        return 'the same message again';
+    }
+
+    // Text that means nothing (a picture with no words is fine)
+    if (!hasImages) return nonsenseReason(text);
+    return null;
+}
+
+// ---------------------------------------------------------------------------
 // Chat messages
 // ---------------------------------------------------------------------------
 client.on(Events.MessageCreate, async (message) => {
@@ -603,6 +753,14 @@ client.on(Events.MessageCreate, async (message) => {
     const hasImages = [...message.attachments.values()].some(a => a.contentType?.startsWith('image/'));
     if (!message.content.trim() && !hasImages) return;
 
+    // Stay silent for spam and messages that mean nothing
+    const ignoreReason = shouldIgnoreMessage(message, hasImages);
+    if (ignoreReason) {
+        console.log(`Ignored a message from ${message.author.username}: ${ignoreReason}`);
+        return;
+    }
+    usersBeingAnswered.add(message.author.id);
+
     // Discord's typing indicator lasts ~10 seconds, so refresh it while waiting for the AI
     message.channel.sendTyping().catch(() => {});
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
@@ -610,32 +768,15 @@ client.on(Events.MessageCreate, async (message) => {
     try {
         const author = message.member?.displayName || message.author.username;
         const userText = message.content.trim() || '(image only)';
-        const promptText = `${author}: ${userText}`;
-
         const imageParts = await buildImageParts(message);
-        const history = channelHistory.get(message.channel.id) ?? [];
 
-        // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
-        const webResults = await getWebResults(userText, history);
-
-        const userParts = [{ text: promptText }];
-        if (webResults) userParts.push({ text: webResults });
-        userParts.push(...imageParts);
-
-        const contents = [
-            ...history,
-            { role: 'user', parts: userParts }
-        ];
-
-        let answer = await askGemini(contents, message.channel.id, message.author.id, Boolean(webResults));
-
-        // Safety net: remove a leading "Name:" if the model still copies the prefix
-        const prefix = `${author}:`;
-        if (answer.startsWith(prefix)) answer = answer.slice(prefix.length).trim();
-
-        // Only remember the exchange if it worked
-        addToHistory(message.channel.id, 'user', imageParts.length ? `${promptText} [attached ${imageParts.length} image(s)]` : promptText);
-        addToHistory(message.channel.id, 'model', answer);
+        const answer = await generateAnswer({
+            channelId: message.channel.id,
+            userId: message.author.id,
+            author,
+            userText,
+            imageParts
+        });
 
         const chunks = splitMessage(answer);
         // allowedMentions stops the AI from pinging @everyone / roles / users by accident
@@ -650,6 +791,7 @@ client.on(Events.MessageCreate, async (message) => {
         await message.reply({ content: friendlyErrorMessage(error), allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
     } finally {
         clearInterval(typingInterval);
+        usersBeingAnswered.delete(message.author.id);
     }
 });
 
