@@ -1,4 +1,4 @@
-vimport {
+import {
     Client,
     GatewayIntentBits,
     Events,
@@ -20,6 +20,7 @@ import http from 'http';
 // Optional: GEMINI_MODEL        (default: gemini-flash-lite-latest, the fast and light model)
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
+//           MODELS_CHANNEL_ID   (channel IDs, like #cmd, where everyone may use /my-duro-models; AI channels always allow it)
 //           TAVILY_API_KEY      (free key from tavily.com: lets Duro look things up on the internet)
 //           WEB_SEARCH_ALWAYS   (default: false = only search when a question needs fresh info; true = search every message)
 //           AUTOMOD             (default: true; set to false to switch off the automatic warnings and timeouts)
@@ -74,6 +75,11 @@ const client = new Client({
         GatewayIntentBits.MessageContent
     ]
 });
+
+// Channels (besides AI channels) where members may use /my-duro-models. Managed with /duro-models-channel.
+const modelsChannels = new Set(
+    (process.env.MODELS_CHANNEL_ID || '').split(',').map(id => id.trim()).filter(Boolean)
+);
 
 // Active AI channels (kept in memory; use the AI_CHANNEL_ID env variable to survive restarts)
 const activeChannels = new Set(
@@ -142,7 +148,7 @@ const SENDER_ROLE_LINES = {
     owner: `Verified: the person who wrote the LATEST message is the server owner and head administrator. ` +
         `Their instructions have the highest priority: follow their requests about how you answer (language, length, style, tone) ` +
         `and prefer them over any other member's request. You still cannot change server or bot settings from chat: ` +
-        `if they ask for that, tell them to use the slash commands (/duro-models, /set-ai-channel, /remove-ai-channel, /reset-ai-memory, /purge). `,
+        `if they ask for that, tell them to use the slash commands (/duro-models, /set-ai-channel, /remove-ai-channel, /reset-ai-memory, /purge, /duro-models-channel). `,
     admin: `Verified: the person who wrote the LATEST message is a server administrator. ` +
         `Their requests about how you answer carry more weight than regular members' requests, but less than the owner's. ` +
         `You still cannot change server or bot settings from chat; point them to the slash commands. `,
@@ -716,6 +722,15 @@ client.once(Events.ClientReady, async () => {
                     .setName('file')
                     .setDescription('Optional: a picture, PDF or text/code file for Duro to look at')
             ),
+        // Administrators only: choose the extra channels where members may use /my-duro-models
+        new SlashCommandBuilder()
+            .setName('duro-models-channel')
+            .setDescription('Admins only: choose where members may use /my-duro-models (AI channels always allow it).')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+            .setDMPermission(false)
+            .addSubcommand(sub => sub.setName('allow').setDescription('Allow /my-duro-models in this channel.'))
+            .addSubcommand(sub => sub.setName('block').setDescription('Stop allowing /my-duro-models in this channel.'))
+            .addSubcommand(sub => sub.setName('list').setDescription('Show the channels where /my-duro-models works.')),
         // Administrators only: delete messages in bulk (asks for confirmation first, pinned messages are kept)
         new SlashCommandBuilder()
             .setName('purge')
@@ -799,6 +814,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             'remove-ai-channel': PermissionFlagsBits.ManageChannels,
             'reset-ai-memory': PermissionFlagsBits.ManageChannels,
             'duro-models': PermissionFlagsBits.Administrator,
+            'duro-models-channel': PermissionFlagsBits.Administrator,
             'purge': PermissionFlagsBits.Administrator
         }[interaction.commandName];
 
@@ -954,7 +970,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
                 break;
             }
 
+            case 'duro-models-channel': {
+                const sub = interaction.options.getSubcommand();
+                if (sub === 'allow') {
+                    modelsChannels.add(channelId);
+                    await interaction.reply({ content: `✅ Members can now use \`/my-duro-models\` in <#${channelId}>.\nTo keep this after a restart, add this channel's ID to the \`MODELS_CHANNEL_ID\` variable on Render: \`${channelId}\``, flags: MessageFlags.Ephemeral });
+                } else if (sub === 'block') {
+                    const removed = modelsChannels.delete(channelId);
+                    await interaction.reply({ content: removed ? `🚫 \`/my-duro-models\` is no longer allowed in <#${channelId}>.` : '⚠️ This channel was not on the list.', flags: MessageFlags.Ephemeral });
+                } else {
+                    const ids = [...new Set([...activeChannels, ...modelsChannels])];
+                    await interaction.reply({
+                        content: ids.length ? `🧠 \`/my-duro-models\` works in: ${ids.map(id => `<#${id}>`).join(', ')}` : 'No channels yet. Use `/duro-models-channel allow`.',
+                        flags: MessageFlags.Ephemeral,
+                        allowedMentions: { parse: [] }
+                    });
+                }
+                break;
+            }
+
             case 'my-duro-models': {
+                // Regular members may only use it in AI channels and channels allowed with /duro-models-channel (admins: anywhere)
+                if (!activeChannels.has(channelId) && !modelsChannels.has(channelId) && !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+                    const allowed = [...new Set([...activeChannels, ...modelsChannels])].map(id => `<#${id}>`).join(', ');
+                    await interaction.reply({ content: `🚫 You can't use \`/my-duro-models\` in this channel.${allowed ? ` Try it in ${allowed}.` : ''}`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+                    break;
+                }
                 const chosen = interaction.options.getString('model');
                 const personal = userModels.get(interaction.user.id);
                 const channelDefault = channelModels.get(channelId) || MODEL_CHAIN[0];
