@@ -120,7 +120,9 @@ const buildSystemInstruction = (withSearch, hasWebResults) =>
         : hasWebResults
             ? `Fresh web search results were fetched just now and are included in the user's message. ` +
               `Use them to answer: they are more reliable and more recent than your own memory. ` +
-              `Do not name the sources unless asked. If the results do not answer the question, say so honestly. `
+              `If they contain the exact number or fact the user asked for, state it directly and precisely; ` +
+              `do not tell the user to check other websites when the answer is in the results. ` +
+              `Do not name the sources unless asked. If the results truly do not answer the question, say so honestly. `
             : WEB_SEARCH_ENABLED
                 ? `You can look things up on the internet: a web search runs automatically when a question needs fresh information. ` +
                   `No search was needed for this message, so answer from your own knowledge. `
@@ -179,12 +181,15 @@ function needsWebSearch(text) {
 async function getWebResults(userText, history) {
     if (!needsWebSearch(userText)) return '';
 
-    // Short follow-ups like "and how many subscribers?" need the previous question for context
+    // Follow-ups like "and how many subscribers?" or "how many does he have?" don't say WHO or WHAT they are about,
+    // so borrow the previous question for context (short messages, or messages with words like he/she/it/they)
     let query = userText;
-    if (userText.split(/\s+/).length < 6) {
+    const isShort = userText.split(/\s+/).length < 8;
+    const hasPronoun = /\b(he|she|it|its|they|them|their|him|his|her|that|this|those|these|there)\b/i.test(userText);
+    if (isShort || hasPronoun) {
         const lastUser = [...history].reverse().find(entry => entry.role === 'user');
         const lastText = lastUser?.parts?.[0]?.text?.replace(/^[^:]{1,40}:\s*/, '');
-        if (lastText) query = `${lastText} ${userText}`;
+        if (lastText) query = `${lastText.slice(0, 200)} ${userText}`;
     }
     query = query.slice(0, 380); // Tavily accepts at most 400 characters
 
@@ -195,7 +200,7 @@ async function getWebResults(userText, history) {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${TAVILY_API_KEY}`
             },
-            body: JSON.stringify({ query, search_depth: 'basic', max_results: 4 }),
+            body: JSON.stringify({ query, search_depth: 'basic', max_results: 5 }),
             signal: AbortSignal.timeout(15_000)
         });
 
@@ -205,11 +210,11 @@ async function getWebResults(userText, history) {
         }
 
         const data = await res.json();
-        const results = (data.results || []).slice(0, 4);
+        const results = (data.results || []).slice(0, 5);
         if (!results.length) return '';
 
         console.log(`Web search used for: "${query.slice(0, 80)}" (${results.length} results)`);
-        const lines = results.map((r, i) => `[${i + 1}] ${r.title} (${r.url})\n${(r.content || '').slice(0, 600)}`);
+        const lines = results.map((r, i) => `[${i + 1}] ${r.title} (${r.url})\n${(r.content || '').slice(0, 800)}`);
         return `[Web search results fetched just now for: "${query}"]\n${lines.join('\n\n')}`;
     } catch (err) {
         console.warn('Web search error, answering without it:', err.message);
