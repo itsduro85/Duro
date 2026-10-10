@@ -107,7 +107,7 @@ const getCurrentDateTimeString = () =>
 
 // Only mention Google Search when the search tool is really attached to the request.
 // (Telling a model to search when it has no search tool makes it fail with MALFORMED_FUNCTION_CALL.)
-const buildSystemInstruction = (withSearch, hasWebResults) =>
+const buildSystemInstruction = (withSearch, hasWebResults, model) =>
     `You are Duro, a helpful AI assistant for the ChaosBoys Discord server. ` +
     `Keep your answers brief, simple, and direct. Use plain Discord-friendly formatting. ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
@@ -115,6 +115,8 @@ const buildSystemInstruction = (withSearch, hasWebResults) =>
     `Never mention where your information came from (no "according to...", no website, account or source names) ` +
     `unless the user explicitly asks for the source. ` +
     `The current date and time is ${getCurrentDateTimeString()}. ` +
+    `You are running on Google's Gemini model "${model}" (this name can be an alias that always points to Google's newest version of that model family). ` +
+    `If asked which model or AI you are, give exactly this name and never guess a different version number. ` +
     (withSearch
         ? `Use Google Search for questions about current facts, numbers, rankings, news, or anything that changes over time. `
         : hasWebResults
@@ -265,7 +267,7 @@ async function buildImageParts(message) {
 // One request to the Gemini API for a specific model
 async function requestGemini(model, contents, withSearch, hasWebResults) {
     const body = {
-        systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch, hasWebResults) }] },
+        systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch, hasWebResults, model) }] },
         contents,
         generationConfig: {
             temperature: 0.7,
@@ -334,7 +336,7 @@ async function askGemini(contents, channelId, userId, hasWebResults = false) {
 
                 if (text) {
                     // Diagnostic: shows in Render logs whether Google Search was really used for this answer
-                    console.log(`Answered with model=${model}, googleSearch=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}, webResults=${hasWebResults}, took=${Date.now() - startedAt}ms`);
+                    console.log(`Answered with model=${model}, googleSearch=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}, webResults=${hasWebResults}, version=${data.modelVersion ?? 'unknown'}, took=${Date.now() - startedAt}ms`);
                     return text;
                 }
 
