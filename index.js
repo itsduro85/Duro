@@ -19,6 +19,8 @@ import http from 'http';
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
 //           TAVILY_API_KEY      (free key from tavily.com: lets Duro look things up on the internet)
 //           WEB_SEARCH_ALWAYS   (default: false = only search when a question needs fresh info; true = search every message)
+//           AUTOMOD             (default: true; set to false to switch off the automatic warnings and timeouts)
+//           MOD_LOG_CHANNEL_ID  (optional: channel ID where Duro reports every warning/timeout for the mods)
 //           PORT                (Render sets this automatically)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -677,6 +679,154 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 // ---------------------------------------------------------------------------
+// Automod: enforces the clear-cut server rules in EVERY channel
+//   Rule 1: no notification spam (flooding, repeating, mass mentions)
+//   Rule 2: no invites to other servers
+// Staff (Administrator, Manage Messages, Moderate Members, Manage Server) are never touched.
+// Punishments grow with repeat offenses: warning -> 10 min -> 1 hour -> 3 hours timeout.
+// ---------------------------------------------------------------------------
+const AUTOMOD_ENABLED = (process.env.AUTOMOD ?? 'true').toLowerCase() !== 'false';
+const MOD_LOG_CHANNEL_ID = process.env.MOD_LOG_CHANNEL_ID;
+
+const AUTOMOD_FLOOD_COUNT = 6;                  // this many messages ...
+const AUTOMOD_FLOOD_WINDOW_MS = 8_000;          // ... within this time = flooding
+const AUTOMOD_REPEAT_COUNT = 3;                 // the same text this many times ...
+const AUTOMOD_REPEAT_WINDOW_MS = 30_000;        // ... within this time = repeating
+const AUTOMOD_MAX_USER_MENTIONS = 5;            // pinging this many different people in one message
+const AUTOMOD_MAX_ROLE_MENTIONS = 2;            // pinging this many roles in one message
+const AUTOMOD_COOLDOWN_MS = 15_000;             // one burst of spam only counts as ONE strike
+const STRIKE_MEMORY_MS = 24 * 60 * 60 * 1000;   // strikes are forgotten after 24 hours
+const PUNISHMENT_STEPS_MIN = [0, 10, 60, 180];  // strike 1 = warning, 2 = 10 min, 3 = 1 hour, 4 and more = 3 hours
+
+const INVITE_PATTERN = /(?:discord\.gg|discord(?:app)?\.com\/invite)\/([a-z0-9-]{2,32})/gi;
+
+const modRecentMessages = new Map();  // userId -> [{ time, text }]
+const modStrikes = new Map();         // userId -> [timestamps]
+const modCooldownUntil = new Map();   // userId -> time
+
+// Looks at one message and returns what rule it breaks, or null if it is fine
+async function findViolation(message) {
+    const userId = message.author.id;
+    const now = Date.now();
+    const text = message.content ?? '';
+    const normalized = text.trim().toLowerCase().replace(/\s+/g, ' ');
+
+    // Remember this person's latest messages for flood / repeat detection
+    const recent = (modRecentMessages.get(userId) ?? []).filter(m => now - m.time < AUTOMOD_REPEAT_WINDOW_MS);
+    recent.push({ time: now, text: normalized });
+    modRecentMessages.set(userId, recent);
+
+    // Rule 2: an invite to ANOTHER server (invites to this server are fine)
+    const codes = [...text.matchAll(INVITE_PATTERN)].map(match => match[1]).slice(0, 3);
+    for (const code of codes) {
+        const invite = await client.fetchInvite(code).catch(() => null);
+        if (invite?.guild && invite.guild.id !== message.guild.id) {
+            return { rule: 'Rule 2 (No Self-Promotion)', reason: 'posting an invite to another server', deleteMessage: true };
+        }
+    }
+
+    // Rule 1: mass mentions
+    if (message.mentions.users.size >= AUTOMOD_MAX_USER_MENTIONS || message.mentions.roles.size >= AUTOMOD_MAX_ROLE_MENTIONS) {
+        return { rule: 'Rule 1 (No Notification Spam)', reason: 'mass mentions', deleteMessage: true };
+    }
+
+    // Rule 1: flooding (many messages very fast)
+    if (recent.filter(m => now - m.time < AUTOMOD_FLOOD_WINDOW_MS).length >= AUTOMOD_FLOOD_COUNT) {
+        return { rule: 'Rule 1 (No Notification Spam)', reason: 'flooding the chat', deleteMessage: false };
+    }
+
+    // Rule 1: repeating the same message
+    if (normalized && recent.filter(m => m.text === normalized).length >= AUTOMOD_REPEAT_COUNT) {
+        return { rule: 'Rule 1 (No Notification Spam)', reason: 'repeating the same message', deleteMessage: false };
+    }
+
+    return null;
+}
+
+const formatMinutes = (minutes) => minutes >= 60 ? `${minutes / 60} hour${minutes >= 120 ? 's' : ''}` : `${minutes} minutes`;
+
+// Warns or times out the person and reports it to the mods
+async function enforceViolation(message, violation) {
+    const member = message.member;
+    const userId = message.author.id;
+    const now = Date.now();
+
+    modCooldownUntil.set(userId, now + AUTOMOD_COOLDOWN_MS);
+    modRecentMessages.delete(userId); // start fresh after the punishment
+
+    const strikes = (modStrikes.get(userId) ?? []).filter(time => now - time < STRIKE_MEMORY_MS);
+    strikes.push(now);
+    modStrikes.set(userId, strikes);
+
+    const minutes = PUNISHMENT_STEPS_MIN[Math.min(strikes.length, PUNISHMENT_STEPS_MIN.length) - 1];
+    const noMentions = { parse: [], users: [userId] }; // ping only the offender, nobody else
+
+    if (violation.deleteMessage) await message.delete().catch(() => {});
+
+    let action = 'warning';
+    let failure = '';
+
+    if (minutes > 0) {
+        try {
+            if (!member?.moderatable) throw new Error("Duro can't time this person out (its role needs to be above theirs, with the Moderate Members permission)");
+            await member.timeout(minutes * 60_000, `${violation.rule}: ${violation.reason}`);
+            action = `timeout for ${formatMinutes(minutes)}`;
+        } catch (error) {
+            failure = error.message;
+            action = 'warning (timeout failed)';
+            console.error('Automod timeout failed:', error.message);
+        }
+    }
+
+    // Public notice in the channel
+    const notice = action.startsWith('timeout')
+        ? `⏱️ <@${userId}> was timed out for ${formatMinutes(minutes)}: ${violation.reason} (${violation.rule}).`
+        : `⚠️ <@${userId}> warning: please stop ${violation.reason} (${violation.rule}). Next time it means a timeout.`;
+    await message.channel.send({ content: notice, allowedMentions: noMentions }).catch(() => {});
+
+    // Report for the mods
+    console.log(`Automod: ${message.author.username} -> ${action} (${violation.reason}, strike ${strikes.length})`);
+    if (MOD_LOG_CHANNEL_ID) {
+        const logChannel = await client.channels.fetch(MOD_LOG_CHANNEL_ID).catch(() => null);
+        const snippet = (message.content || '(no text)').slice(0, 200);
+        await logChannel?.send({
+            content: `🛡️ **Automod** | ${message.author.username} (<@${userId}>) in <#${message.channel.id}>\n` +
+                `Reason: ${violation.reason} (${violation.rule})\nAction: ${action} (strike ${strikes.length} in 24h)\n` +
+                (failure ? `Problem: ${failure}\n` : '') + `Message: ${snippet}`,
+            allowedMentions: { parse: [] }
+        }).catch(() => {});
+    }
+}
+
+// Returns true if the message broke a rule and was handled (so Duro should not answer it)
+async function runAutomod(message) {
+    try {
+        const staffPermissions = [
+            PermissionFlagsBits.Administrator,
+            PermissionFlagsBits.ManageMessages,
+            PermissionFlagsBits.ModerateMembers,
+            PermissionFlagsBits.ManageGuild
+        ];
+        if (message.member?.permissions.any(staffPermissions)) return false;
+
+        const violation = await findViolation(message);
+        if (!violation) return false;
+
+        // Same burst of spam: no extra strike, but still remove mass-mention / invite messages
+        if (Date.now() < (modCooldownUntil.get(message.author.id) ?? 0)) {
+            if (violation.deleteMessage) await message.delete().catch(() => {});
+            return true;
+        }
+
+        await enforceViolation(message, violation);
+        return true;
+    } catch (error) {
+        console.error('Automod error:', error);
+        return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Spam and nonsense filter (for normal chat in AI channels; /ask-duro is always answered)
 // ---------------------------------------------------------------------------
 const SPAM_WINDOW_MS = 30_000;        // look at the last 30 seconds of a person's messages
@@ -748,7 +898,12 @@ function shouldIgnoreMessage(message, hasImages) {
 // Chat messages
 // ---------------------------------------------------------------------------
 client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot || !message.inGuild() || !activeChannels.has(message.channel.id)) return;
+    if (message.author.bot || !message.inGuild()) return;
+
+    // Server rules first: this runs in EVERY channel, not only AI channels
+    if (AUTOMOD_ENABLED && await runAutomod(message)) return;
+
+    if (!activeChannels.has(message.channel.id)) return;
 
     const hasImages = [...message.attachments.values()].some(a => a.contentType?.startsWith('image/'));
     if (!message.content.trim() && !hasImages) return;
