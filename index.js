@@ -17,10 +17,19 @@ import http from 'http';
 // Optional: GEMINI_MODEL        (default: gemini-flash-latest, always points to the newest Flash model)
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
+//           TAVILY_API_KEY      (free key from tavily.com: lets Duro look things up on the internet)
+//           WEB_SEARCH_ALWAYS   (default: false = only search when a question needs fresh info; true = search every message)
 //           PORT                (Render sets this automatically)
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const USE_SEARCH = (process.env.USE_SEARCH ?? 'true').toLowerCase() !== 'false';
+
+// Web search through Tavily (independent of Google's search quota)
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const WEB_SEARCH_ENABLED = Boolean(TAVILY_API_KEY);
+const WEB_SEARCH_ALWAYS = (process.env.WEB_SEARCH_ALWAYS ?? 'false').toLowerCase() === 'true';
+// Words that suggest the question needs fresh information from the internet
+const FRESH_INFO_PATTERN = /\b(latest|newest|current|currently|today|tonight|now|recent|recently|news|update|updated|version|release|released|price|cost|how many|how much|score|weather|who is|who won|ranking|rank|trending|this (week|month|year)|20(2[4-9]|3\d))\b/i;
 
 // Model names change often. Aliases like "-latest" avoid your bot breaking when old models are retired.
 const MODEL_CHAIN = [...new Set([
@@ -98,7 +107,7 @@ const getCurrentDateTimeString = () =>
 
 // Only mention Google Search when the search tool is really attached to the request.
 // (Telling a model to search when it has no search tool makes it fail with MALFORMED_FUNCTION_CALL.)
-const buildSystemInstruction = (withSearch) =>
+const buildSystemInstruction = (withSearch, hasWebResults) =>
     `You are Duro, a helpful AI assistant for the ChaosBoys Discord server. ` +
     `Keep your answers brief, simple, and direct. Use plain Discord-friendly formatting. ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
@@ -106,8 +115,12 @@ const buildSystemInstruction = (withSearch) =>
     `The current date and time is ${getCurrentDateTimeString()}. ` +
     (withSearch
         ? `Use Google Search for questions about current facts, numbers, rankings, news, or anything that changes over time. `
-        : `You cannot search the internet right now. For anything that may have changed recently ` +
-          `(news, subscriber counts, prices, scores, releases), give your best knowledge and clearly say it may be outdated. `);
+        : hasWebResults
+            ? `Fresh web search results were fetched just now and are included in the user's message. ` +
+              `Use them to answer: they are more reliable and more recent than your own memory. ` +
+              `Briefly mention the source site when useful. If the results do not answer the question, say so honestly. `
+            : `You cannot search the internet right now. For anything that may have changed recently ` +
+              `(news, subscriber counts, prices, scores, releases), give your best knowledge and clearly say it may be outdated. `);
 
 class GeminiError extends Error {
     constructor(message, status) {
@@ -148,6 +161,55 @@ async function getAvailableModels() {
     models.sort((a, b) => a.id.localeCompare(b.id));
     modelListCache = { fetchedAt: Date.now(), models };
     return models;
+}
+
+// Decide if a message looks like it needs fresh information from the internet
+function needsWebSearch(text) {
+    if (!WEB_SEARCH_ENABLED) return false;
+    if (WEB_SEARCH_ALWAYS) return text.length >= 4;
+    return FRESH_INFO_PATTERN.test(text);
+}
+
+// Look the question up with Tavily and return the results as text for Gemini (empty string = no results)
+async function getWebResults(userText, history) {
+    if (!needsWebSearch(userText)) return '';
+
+    // Short follow-ups like "and how many subscribers?" need the previous question for context
+    let query = userText;
+    if (userText.split(/\s+/).length < 6) {
+        const lastUser = [...history].reverse().find(entry => entry.role === 'user');
+        const lastText = lastUser?.parts?.[0]?.text?.replace(/^[^:]{1,40}:\s*/, '');
+        if (lastText) query = `${lastText} ${userText}`;
+    }
+    query = query.slice(0, 380); // Tavily accepts at most 400 characters
+
+    try {
+        const res = await fetch('https://api.tavily.com/search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${TAVILY_API_KEY}`
+            },
+            body: JSON.stringify({ query, search_depth: 'basic', max_results: 4 }),
+            signal: AbortSignal.timeout(15_000)
+        });
+
+        if (!res.ok) {
+            console.warn(`Web search failed (HTTP ${res.status}), answering without it.`);
+            return '';
+        }
+
+        const data = await res.json();
+        const results = (data.results || []).slice(0, 4);
+        if (!results.length) return '';
+
+        console.log(`Web search used for: "${query.slice(0, 80)}" (${results.length} results)`);
+        const lines = results.map((r, i) => `[${i + 1}] ${r.title} (${r.url})\n${(r.content || '').slice(0, 600)}`);
+        return `[Web search results fetched just now for: "${query}"]\n${lines.join('\n\n')}`;
+    } catch (err) {
+        console.warn('Web search error, answering without it:', err.message);
+        return '';
+    }
 }
 
 // Split long text into Discord-sized pieces, preferring line/word boundaries
@@ -191,9 +253,9 @@ async function buildImageParts(message) {
 }
 
 // One request to the Gemini API for a specific model
-async function requestGemini(model, contents, withSearch) {
+async function requestGemini(model, contents, withSearch, hasWebResults) {
     const body = {
-        systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch) }] },
+        systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch, hasWebResults) }] },
         contents,
         generationConfig: {
             temperature: 0.7,
@@ -228,7 +290,7 @@ async function requestGemini(model, contents, withSearch) {
 }
 
 // Tries search first, then no search, then the fallback model
-async function askGemini(contents, channelId, userId) {
+async function askGemini(contents, channelId, userId, hasWebResults = false) {
     let lastError;
 
     // Priority: the user's personal model, then the channel model, then the default models as backups
@@ -239,12 +301,13 @@ async function askGemini(contents, channelId, userId) {
     ].filter(Boolean))];
 
     for (const model of modelsToTry) {
-        const searchAllowed = USE_SEARCH && Date.now() >= searchBlockedUntil;
+        // If we already have web results, don't spend Google's search quota as well
+        const searchAllowed = USE_SEARCH && !hasWebResults && Date.now() >= searchBlockedUntil;
         const attempts = searchAllowed ? [true, false] : [false];
 
         for (const withSearch of attempts) {
             try {
-                const data = await requestGemini(model, contents, withSearch);
+                const data = await requestGemini(model, contents, withSearch, hasWebResults);
 
                 if (data.promptFeedback?.blockReason) {
                     return "⚠️ I can't answer that one (it was blocked by safety filters).";
@@ -259,7 +322,7 @@ async function askGemini(contents, channelId, userId) {
 
                 if (text) {
                     // Diagnostic: shows in Render logs whether Google Search was really used for this answer
-                    console.log(`Answered with model=${model}, searchRequested=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}`);
+                    console.log(`Answered with model=${model}, googleSearch=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}, webResults=${hasWebResults}`);
                     return text;
                 }
 
@@ -538,12 +601,19 @@ client.on(Events.MessageCreate, async (message) => {
         const imageParts = await buildImageParts(message);
         const history = channelHistory.get(message.channel.id) ?? [];
 
+        // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
+        const webResults = await getWebResults(userText, history);
+
+        const userParts = [{ text: promptText }];
+        if (webResults) userParts.push({ text: webResults });
+        userParts.push(...imageParts);
+
         const contents = [
             ...history,
-            { role: 'user', parts: [{ text: promptText }, ...imageParts] }
+            { role: 'user', parts: userParts }
         ];
 
-        let answer = await askGemini(contents, message.channel.id, message.author.id);
+        let answer = await askGemini(contents, message.channel.id, message.author.id, Boolean(webResults));
 
         // Safety net: remove a leading "Name:" if the model still copies the prefix
         const prefix = `${author}:`;
