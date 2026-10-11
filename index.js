@@ -9,7 +9,8 @@ import {
     MessageFlags,
     ActionRowBuilder,
     ButtonBuilder,
-    ButtonStyle
+    ButtonStyle,
+    AttachmentBuilder
 } from 'discord.js';
 import http from 'http';
 
@@ -20,6 +21,7 @@ import http from 'http';
 // Optional: GEMINI_MODEL        (default: gemini-flash-lite-latest, the fast and light model)
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
+//           IMAGE_MODEL         (optional: Gemini image model for /imagine; by default Duro picks one your API key can use)
 //           MODELS_CHANNEL_ID   (channel IDs, like #cmd, where everyone may use /my-duro-models; AI channels always allow it)
 //           TAVILY_API_KEY      (free key from tavily.com: lets Duro look things up on the internet)
 //           WEB_SEARCH_ALWAYS   (default: false = only search when a question needs fresh info; true = search every message)
@@ -169,6 +171,7 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `including the exact version number and name when they ask for the latest release, and stops once the question is fully answered. ` +
     `Never pad with filler, never repeat the question, and never cut a needed explanation short. ` +
     `Use Discord markdown (bold, bullet lists, short headers only when they help). Reply in the language the person writes in. ` +
+    `You cannot draw or generate pictures in a chat reply; if someone asks you to draw or make an image, tell them to use the /imagine command. ` +
     `You can look at pictures, PDFs and text/code files that people attach (not GIFs, videos or other file types: if someone sends one of those, say you can't open that type). ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
     `but NEVER start your own reply with a name or "Name:", just answer directly. ` +
@@ -501,6 +504,97 @@ function addToHistory(channelId, role, text) {
     channelHistory.set(channelId, history);
 }
 
+// ---------------------------------------------------------------------------
+// /imagine: picture generation with a Gemini image model
+// ---------------------------------------------------------------------------
+const IMAGE_MODEL_ENV = process.env.IMAGE_MODEL;
+const IMAGE_COOLDOWN_MS = 30_000;   // one picture per person every 30 seconds (image quotas are small)
+const imageCooldowns = new Map();
+let imageModelCache = { models: [], fetchedAt: 0 };
+
+// Image models are hidden from the normal model list, so look for them separately
+async function getImageModels() {
+    if (Date.now() - imageModelCache.fetchedAt < 10 * 60 * 1000 && imageModelCache.models.length) return imageModelCache.models;
+
+    const found = [];
+    let pageToken = '';
+    do {
+        const url = `${GEMINI_BASE_URL}?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+        const res = await fetch(url, { headers: { 'x-goog-api-key': GEMINI_API_KEY }, signal: AbortSignal.timeout(15_000) });
+        if (!res.ok) throw new GeminiError(`ListModels failed (HTTP ${res.status})`, res.status);
+        const data = await res.json();
+        for (const m of data.models || []) {
+            const id = m.name.replace(/^models\//, '');
+            if (m.supportedGenerationMethods?.includes('generateContent') && /^gemini.*image/i.test(id)) found.push(id);
+        }
+        pageToken = data.nextPageToken || '';
+    } while (pageToken);
+
+    // The cheaper "flash" image models first, then the rest
+    found.sort((a, b) => (/flash/i.test(b) - /flash/i.test(a)) || a.localeCompare(b));
+    imageModelCache = { models: found, fetchedAt: Date.now() };
+    return found;
+}
+
+// Returns { buffer, mimeType, text, model }. Throws an Error with a friendly message if no picture could be made.
+async function generateImage(prompt, inputParts = []) {
+    let candidates = IMAGE_MODEL_ENV ? [IMAGE_MODEL_ENV] : [];
+    try {
+        for (const id of await getImageModels()) if (!candidates.includes(id)) candidates.push(id);
+    } catch (error) {
+        console.warn('Could not list image models:', error.message);
+    }
+    candidates = candidates.slice(0, 3);
+    if (!candidates.length) {
+        throw new Error("My API key doesn't have an image model. Ask Arefin to set `IMAGE_MODEL` on Render or check the key's access.");
+    }
+
+    let lastProblem = 'Image generation failed.';
+    for (const model of candidates) {
+        try {
+            const res = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+                body: JSON.stringify({
+                    contents: [{ role: 'user', parts: [{ text: prompt }, ...inputParts] }],
+                    generationConfig: { responseModalities: ['TEXT', 'IMAGE'] }
+                }),
+                signal: AbortSignal.timeout(90_000)
+            });
+
+            if (!res.ok) {
+                const detail = (await res.text().catch(() => '')).slice(0, 300);
+                console.warn(`Image model ${model} failed (HTTP ${res.status}): ${detail}`);
+                if (res.status === 429) lastProblem = 'The image quota is used up for now. Try again later.';
+                else if (res.status === 404 || res.status === 400) lastProblem = `The image model \`${model}\` isn't usable with my API key.`;
+                else lastProblem = 'The image service is busy right now. Try again in a minute.';
+                continue;
+            }
+
+            const data = await res.json();
+            const parts = data.candidates?.[0]?.content?.parts ?? [];
+            const imagePart = parts.find(p => (p.inlineData ?? p.inline_data)?.data);
+            if (imagePart) {
+                const inline = imagePart.inlineData ?? imagePart.inline_data;
+                return {
+                    buffer: Buffer.from(inline.data, 'base64'),
+                    mimeType: inline.mimeType ?? inline.mime_type ?? 'image/png',
+                    text: parts.filter(p => p.text).map(p => p.text).join(' ').trim(),
+                    model
+                };
+            }
+            // No picture: Google's safety filter or the model only answered with words
+            const why = data.promptFeedback?.blockReason || data.candidates?.[0]?.finishReason;
+            console.warn(`Image model ${model} returned no picture (${why ?? 'no reason'})`);
+            lastProblem = "I couldn't make that picture. It may go against Google's safety rules. Try describing it differently.";
+        } catch (error) {
+            console.warn(`Image model ${model} error:`, error.message);
+            lastProblem = 'The image service took too long. Try again.';
+        }
+    }
+    throw new Error(lastProblem);
+}
+
 // Shared by normal chat messages and /ask-duro: builds the prompt, looks things up on the web if needed,
 // asks Gemini, remembers the exchange, and returns the final answer text
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member' }) {
@@ -722,6 +816,17 @@ client.once(Events.ClientReady, async () => {
                     .setName('file')
                     .setDescription('Optional: a picture, PDF or text/code file for Duro to look at')
             ),
+        // Open to everyone, in any server channel: make a picture
+        new SlashCommandBuilder()
+            .setName('imagine')
+            .setDescription('Make a picture with AI.')
+            .setDMPermission(false)
+            .addStringOption(option =>
+                option.setName('prompt').setDescription('Describe the picture you want').setRequired(true).setMaxLength(500)
+            )
+            .addAttachmentOption(option =>
+                option.setName('image').setDescription('Optional: a picture to change or use as a base')
+            ),
         // Administrators only: choose the extra channels where members may use /my-duro-models
         new SlashCommandBuilder()
             .setName('duro-models-channel')
@@ -925,6 +1030,36 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     allowedMentions: { parse: [] },
                     flags: MessageFlags.Ephemeral
                 });
+                break;
+            }
+
+            case 'imagine': {
+                const prompt = interaction.options.getString('prompt', true).trim();
+                const source = interaction.options.getAttachment('image');
+
+                const waitMs = IMAGE_COOLDOWN_MS - (Date.now() - (imageCooldowns.get(interaction.user.id) ?? 0));
+                if (waitMs > 0) {
+                    await interaction.reply({ content: `⏳ Please wait ${Math.ceil(waitMs / 1000)} more second(s) before making another picture.`, flags: MessageFlags.Ephemeral });
+                    break;
+                }
+                imageCooldowns.set(interaction.user.id, Date.now());
+
+                await interaction.deferReply();
+                try {
+                    const inputParts = source ? await buildAttachmentParts(new Map([[source.id, source]])) : [];
+                    const result = await generateImage(prompt, inputParts.filter(p => p.inlineData));
+                    const extension = result.mimeType.includes('jpeg') ? 'jpg' : (result.mimeType.split('/')[1] || 'png');
+                    await interaction.editReply({
+                        content: `🎨 **${prompt.slice(0, 200)}**\nMade for <@${interaction.user.id}>`,
+                        files: [new AttachmentBuilder(result.buffer, { name: `duro-image.${extension}` })],
+                        allowedMentions: { parse: [] }
+                    });
+                    console.log(`Image made for ${interaction.user.username} with ${result.model}`);
+                } catch (error) {
+                    imageCooldowns.delete(interaction.user.id); // a failed try doesn't count
+                    console.error('/imagine error:', error.message);
+                    await interaction.editReply({ content: `⚠️ ${error.message}`, allowedMentions: { parse: [] } }).catch(() => {});
+                }
                 break;
             }
 
