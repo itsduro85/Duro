@@ -240,7 +240,7 @@ async function getAvailableModels() {
             if (!m.supportedGenerationMethods?.includes('generateContent')) continue;
             if (!id.startsWith('gemini')) continue;
             // Skip models that don't do normal text chat (image, voice, embeddings, live audio, etc.)
-            if (/image|tts|embed|live|audio|robotics|computer-use|aqa/i.test(id)) continue;
+            if (/image|banana|tts|embed|live|audio|robotics|computer-use|aqa/i.test(id)) continue;
             models.push({ id, displayName: m.displayName || id });
         }
         pageToken = data.nextPageToken || '';
@@ -525,13 +525,13 @@ async function getImageModels() {
         const data = await res.json();
         for (const m of data.models || []) {
             const id = m.name.replace(/^models\//, '');
-            if (m.supportedGenerationMethods?.includes('generateContent') && /^gemini.*image/i.test(id)) found.push(id);
+            if (m.supportedGenerationMethods?.includes('generateContent') && /^gemini.*(image|banana)/i.test(id)) found.push(id);
         }
         pageToken = data.nextPageToken || '';
     } while (pageToken);
 
-    // The cheaper "flash" image models first, then the rest
-    found.sort((a, b) => (/flash/i.test(b) - /flash/i.test(a)) || a.localeCompare(b));
+    // "Nano Banana" (Google's image model name) first with the newest version on top, then the cheaper "flash" image models
+    found.sort((a, b) => (/banana/i.test(b) - /banana/i.test(a)) || (/flash/i.test(b) - /flash/i.test(a)) || b.localeCompare(a));
     imageModelCache = { models: found, fetchedAt: Date.now() };
     return found;
 }
