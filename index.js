@@ -809,7 +809,7 @@ client.once(Events.ClientReady, async () => {
                     .setName('message')
                     .setDescription('What do you want to ask Duro?')
                     .setRequired(true)
-                    .setMaxLength(1000)
+                    .setMaxLength(4000)
             )
             .addAttachmentOption(option =>
                 option
@@ -822,7 +822,7 @@ client.once(Events.ClientReady, async () => {
             .setDescription('Make a picture with AI.')
             .setDMPermission(false)
             .addStringOption(option =>
-                option.setName('prompt').setDescription('Describe the picture you want').setRequired(true).setMaxLength(500)
+                option.setName('prompt').setDescription('Describe the picture you want (long, detailed prompts are fine)').setRequired(true).setMaxLength(4000)
             )
             .addAttachmentOption(option =>
                 option.setName('image').setDescription('Optional: a picture to change or use as a base')
