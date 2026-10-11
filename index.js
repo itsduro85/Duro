@@ -96,9 +96,6 @@ const channelModels = new Map();
 // Personal model chosen by each user with /my-duro-models (works in every AI channel, beats the channel model)
 const userModels = new Map();
 
-// Small cooldown for /ask-duro so nobody burns the free quota by accident
-const ASK_COOLDOWN_MS = 5000;
-const askCooldowns = new Map();
 
 // Remembers when Duro last spoke to someone in a channel (an answer or a warning), key = "channelId:userId".
 // A short "ok" or "thanks" right after that is a reaction to Duro, so it is allowed in AI channels.
@@ -515,7 +512,7 @@ function addToHistory(channelId, role, text) {
     channelHistory.set(channelId, history);
 }
 
-// Shared by normal chat messages and /ask-duro: builds the prompt, looks things up on the web if needed,
+// Used for every answer (AI channels and @Duro mentions): builds the prompt, looks things up on the web if needed,
 // asks Gemini, remembers the exchange, and returns the final answer text
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member' }) {
     // The role tag is added by the code from Discord's data, so the AI can tell who is really an admin
@@ -718,23 +715,6 @@ client.once(Events.ClientReady, async () => {
                     .setName('model')
                     .setDescription('Type to search the models available (leave empty to see your current one)')
                     .setAutocomplete(true)
-            ),
-        // Open to everyone: ask Duro something in ANY server channel (not in DMs), even if it isn't an AI channel
-        new SlashCommandBuilder()
-            .setName('ask-duro')
-            .setDescription('Ask Duro a question in any channel.')
-            .setDMPermission(false)
-            .addStringOption(option =>
-                option
-                    .setName('message')
-                    .setDescription('What do you want to ask Duro?')
-                    .setRequired(true)
-                    .setMaxLength(4000)
-            )
-            .addAttachmentOption(option =>
-                option
-                    .setName('file')
-                    .setDescription('Optional: a picture, PDF or text/code file for Duro to look at')
             ),
         // Administrators only: choose the extra channels where members may use /my-duro-models
         new SlashCommandBuilder()
@@ -939,48 +919,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     allowedMentions: { parse: [] },
                     flags: MessageFlags.Ephemeral
                 });
-                break;
-            }
-
-            case 'ask-duro': {
-                const userText = interaction.options.getString('message', true).trim();
-                const file = interaction.options.getAttachment('file');
-                if (!userText) {
-                    await interaction.reply({ content: '⚠️ Type a question after `/ask-duro`.', flags: MessageFlags.Ephemeral });
-                    break;
-                }
-
-                const waitMs = ASK_COOLDOWN_MS - (Date.now() - (askCooldowns.get(interaction.user.id) ?? 0));
-                if (waitMs > 0) {
-                    await interaction.reply({ content: `⏳ Please wait ${Math.ceil(waitMs / 1000)} more second(s) before asking again.`, flags: MessageFlags.Ephemeral });
-                    break;
-                }
-                askCooldowns.set(interaction.user.id, Date.now());
-
-                // Thinking can take longer than Discord's 3-second limit, so acknowledge right away
-                await interaction.deferReply();
-                const safeMentions = { parse: [] };
-
-                try {
-                    const answer = await generateAnswer({
-                        channelId,
-                        userId: interaction.user.id,
-                        author: interaction.member?.displayName || interaction.user.username,
-                        userText,
-                        imageParts: await buildAttachmentParts(new Map(file ? [[file.id, file]] : [])),
-                        senderRole: getSenderRole(interaction.user, interaction.memberPermissions, interaction.guild)
-                    });
-
-                    const chunks = splitMessage(answer);
-                    await interaction.editReply({ content: chunks[0], allowedMentions: safeMentions });
-                    duroSpokeTo.set(`${channelId}:${interaction.user.id}`, Date.now());
-                    for (const chunk of chunks.slice(1)) {
-                        await interaction.followUp({ content: chunk, allowedMentions: safeMentions });
-                    }
-                } catch (error) {
-                    console.error('/ask-duro error:', error);
-                    await interaction.editReply({ content: friendlyErrorMessage(error), allowedMentions: safeMentions }).catch(() => {});
-                }
                 break;
             }
 
@@ -1250,7 +1188,7 @@ async function runAutomod(message) {
 }
 
 // ---------------------------------------------------------------------------
-// Spam and nonsense filter (for normal chat in AI channels; /ask-duro is always answered)
+// Spam and nonsense filter (for normal chat in AI channels; a message that mentions @Duro is always answered)
 // ---------------------------------------------------------------------------
 const SPAM_WINDOW_MS = 30_000;        // look at the last 30 seconds of a person's messages
 const SPAM_MAX_MESSAGES = 5;          // more than this many in the window = flooding
@@ -1337,14 +1275,24 @@ client.on(Events.MessageCreate, async (message) => {
     // Server rules first: this runs in EVERY channel, not only AI channels
     if (AUTOMOD_ENABLED && await runAutomod(message)) return;
 
-    if (!activeChannels.has(message.channel.id)) return;
+    // In any channel, @Duro followed by a question gets an answer (this needs no slash-command permission)
+    const mentionPattern = new RegExp(`<@!?${client.user.id}>`, 'g');
+    const mentioned = message.mentions.users.has(client.user.id) && !message.mentions.everyone;
+    const inAiChannel = activeChannels.has(message.channel.id);
+    if (!inAiChannel && !mentioned) return;
 
     const hasImages = hasReadableAttachment(message.attachments); // pictures, PDFs and text files
-    if (!message.content.trim() && !hasImages) return;
+    const spokenText = mentioned ? message.content.replace(mentionPattern, '').trim() : message.content.trim();
+    if (!spokenText && !hasImages) {
+        // Only "@Duro" with nothing else
+        if (mentioned) await message.reply({ content: `Hi ${message.member?.displayName || message.author.username}! Ask me anything.`, allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
+        return;
+    }
 
     // In an AI channel, messages that mean nothing (random emoji, GIF or link only, "ok", "lol", gibberish)
     // are removed, unless they react to something Duro said. Staff are never touched.
-    if (!hasImages && !isStaff(message.member)) {
+    // A message that mentions @Duro is addressed to Duro, so it is never removed.
+    if (inAiChannel && !mentioned && !hasImages && !isStaff(message.member)) {
         const meaningless = nonsenseReason(message.content);
         if (meaningless && !(await pointsAtDuro(message))) {
             await message.delete().catch(() => {});
@@ -1354,7 +1302,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // Stay silent for spam and messages that mean nothing
-    const ignoreReason = shouldIgnoreMessage(message, hasImages);
+    const ignoreReason = shouldIgnoreMessage(message, hasImages || mentioned); // a message that mentions @Duro is a real question
     if (ignoreReason) {
         console.log(`Ignored a message from ${message.author.username}: ${ignoreReason}`);
         return;
@@ -1367,7 +1315,7 @@ client.on(Events.MessageCreate, async (message) => {
 
     try {
         const author = message.member?.displayName || message.author.username;
-        const userText = message.content.trim() || '(file only)';
+        const userText = spokenText || '(file only)';
         const imageParts = await buildAttachmentParts(message.attachments);
 
         const answer = await generateAnswer({
