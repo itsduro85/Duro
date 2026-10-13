@@ -1,3 +1,4 @@
+
 import {
     Client,
     GatewayIntentBits,
@@ -486,14 +487,20 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
     let lastError;
     const startedAt = Date.now();
 
-    // Priority: the user's personal model, then the channel model, then the default models as backups
-    const modelsToTry = [...new Set([
+    // Priority: the user's personal model, then the channel model, then the default models as backups.
+    // Models that just hit their limit (or are overloaded) rest for a while and are skipped, so answers don't wait on them.
+    const preferred = [...new Set([
         userModels.get(userId),
         channelModels.get(channelId),
         ...MODEL_CHAIN
     ].filter(Boolean))];
+    const ready = preferred.filter(model => !isResting(model));
+    const tried = new Set();
 
+    // Returns the answer text, or undefined when none of these models could answer
+    const attemptModels = async (modelsToTry) => {
     for (const model of modelsToTry) {
+        tried.add(model);
         // Google's own search is only a fallback for when Tavily isn't set up. With Tavily on, skipping it
         // saves a slow extra request on every message (and doesn't touch Google's small search quota).
         const searchAllowed = USE_SEARCH && !WEB_SEARCH_ENABLED && !hasWebResults && Date.now() >= searchBlockedUntil;
@@ -533,6 +540,8 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
                     searchBlockedUntil = Date.now() + SEARCH_COOLDOWN_MS;
                     console.warn('Search quota reached, answering without Google Search for the next 30 minutes.');
                 }
+                // This model hit its limit, is overloaded or is gone: let it rest and move on to the next one
+                restModel(model, err);
                 // Google is overloaded (HTTP 500/503): short pause before trying the next option
                 if (err.status === 500 || err.status === 503) await new Promise(resolve => setTimeout(resolve, 1500));
 
@@ -544,7 +553,61 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
             }
         }
     }
+    };
+
+    // 1) the chosen and default models that aren't resting
+    let answer = ready.length ? await attemptModels(ready) : undefined;
+    if (answer !== undefined) return answer;
+
+    // 2) every other text model that has free quota on this API key, one after another
+    const fallbacks = (await getAvailableModels().catch(() => []))
+        .map(m => m.id)
+        .filter(id => !tried.has(id) && !isResting(id) && !preferred.includes(id))
+        .sort((a, b) => fallbackRank(a) - fallbackRank(b))
+        .slice(0, 4);
+    if (fallbacks.length) {
+        console.warn(`Switching to other available models: ${fallbacks.join(', ')}`);
+        answer = await attemptModels(fallbacks);
+        if (answer !== undefined) return answer;
+    }
+
+    // 3) last chance: the resting models (a limit may have reset since)
+    const resting = preferred.filter(model => !tried.has(model));
+    if (resting.length) {
+        answer = await attemptModels(resting);
+        if (answer !== undefined) return answer;
+    }
     throw lastError ?? new GeminiError('Unknown Gemini failure');
+}
+
+// ---- Automatic model switching: a model that hits its limit rests, and Duro uses the next available model ----
+const modelRestUntil = new Map(); // model id -> time until which it is skipped
+
+function isResting(model) {
+    return (modelRestUntil.get(model) ?? 0) > Date.now();
+}
+
+function restModel(model, err) {
+    let minutes = 0;
+    if (err.status === 429) {
+        // "per day" limits last long; per-minute limits are over quickly
+        minutes = /per ?day|daily|PerDay/i.test(err.message) || /limit: 0/i.test(err.message) ? 60 : 1.5;
+    } else if (err.status === 500 || err.status === 503 || err.name === 'TimeoutError' || err.name === 'AbortError') {
+        minutes = 1;
+    } else if (err.status === 404) {
+        minutes = 360;
+    }
+    if (minutes) {
+        modelRestUntil.set(model, Date.now() + minutes * 60_000);
+        console.warn(`Model ${model} rests for ${minutes} minute(s) (${err.status ?? err.name}). Duro uses another model meanwhile.`);
+    }
+}
+
+// Which extra models to try first: light/fast Flash models, then other Flash models, then anything else
+function fallbackRank(id) {
+    if (/flash.*lite|lite.*flash/i.test(id)) return 0;
+    if (/flash/i.test(id)) return 1;
+    return 2;
 }
 
 function friendlyErrorMessage(err) {
