@@ -1,4 +1,3 @@
-
 import {
     Client,
     GatewayIntentBits,
@@ -62,7 +61,8 @@ const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models
 const MAX_HISTORY_MESSAGES = 12;          // short memory per channel (user + bot messages)
 const MAX_IMAGES_PER_MESSAGE = 4;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per image
-const REQUEST_TIMEOUT_MS = 30_000;        // give up on a stuck model sooner and try the backup
+const REQUEST_TIMEOUT_MS = 30_000;        // give up on a stuck model (questions with pictures, PDFs or files, which take longer)
+const TEXT_REQUEST_TIMEOUT_MS = 12_000;   // plain text questions: if a model hasn't answered in 12 seconds, switch to the next one
 const DISCORD_CHUNK_SIZE = 1900;          // Discord's hard limit is 2000 characters
 
 // Who is trusted. This is checked with Discord's own data, NEVER by what someone types in a message
@@ -451,7 +451,7 @@ async function requestGemini(model, contents, withSearch, hasWebResults, senderR
             'x-goog-api-key': GEMINI_API_KEY // key in a header, not in the URL, so it never leaks into logs
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+        signal: AbortSignal.timeout(JSON.stringify(contents).includes('"inlineData"') ? REQUEST_TIMEOUT_MS : TEXT_REQUEST_TIMEOUT_MS)
     });
 
     const raw = await response.text();
