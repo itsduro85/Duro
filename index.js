@@ -469,7 +469,20 @@ async function requestGemini(model, contents, withSearch, hasWebResults, senderR
 }
 
 // Tries search first, then no search, then the fallback model
-async function askGemini(contents, channelId, userId, hasWebResults = false, senderRole = 'member', notesText = '') {
+// If Google is overloaded (503/500) or too slow, wait a few seconds and run the whole model list one more time
+async function askGemini(...args) {
+    try {
+        return await askGeminiOnce(...args);
+    } catch (err) {
+        const overloaded = err?.status === 503 || err?.status === 500 || err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        if (!overloaded) throw err;
+        console.warn('Google is overloaded or slow, trying once more in 4 seconds...');
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        return await askGeminiOnce(...args);
+    }
+}
+
+async function askGeminiOnce(contents, channelId, userId, hasWebResults = false, senderRole = 'member', notesText = '') {
     let lastError;
     const startedAt = Date.now();
 
@@ -536,6 +549,7 @@ async function askGemini(contents, channelId, userId, hasWebResults = false, sen
 
 function friendlyErrorMessage(err) {
     if (err instanceof GeminiError) {
+        if (err.status === 503 || err.status === 500) return '🌐 Google\'s AI is overloaded right now (not a problem on my side). Please ask again in a minute.';
         if (err.status === 429) return '⏳ I\'m getting too many requests right now. Please try again in a minute.';
         if (err.status === 401 || err.status === 403) return '🔑 My Gemini API key was rejected. The server owner needs to check it.';
         if (err.status === 404) return '🛠️ The AI model I\'m set to use is no longer available. The server owner needs to update GEMINI_MODEL.';
@@ -573,6 +587,22 @@ function removeMentionCodes(text, allowedUserIds = new Set()) {
         .trim();
 }
 
+// Waits for a promise at most `ms` milliseconds; on timeout or error it logs and returns null
+async function withTimeout(promise, ms, label) {
+    let timer;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms); })
+        ]);
+    } catch (error) {
+        console.warn(`Skipped ${label}: ${error.message}`);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null }) {
     if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return REFUSAL_TEXT;
 
@@ -591,9 +621,11 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
 
     // Only the saved prompts that fit this conversation are sent (a person's name, a topic like "minecraft")
     const lastUserText = [...history].reverse().find(entry => entry.role === 'user')?.parts?.[0]?.text ?? '';
-    await resolveMemberNames(guild);
+    // Both lookups have a time limit: if Discord is slow, Duro answers without them instead of getting stuck
+    await withTimeout(resolveMemberNames(guild), 6000, 'member names');
     // plus the newest messages of the channels the owner set to "always read" (rules, announcements, ...)
-    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), await getLiveChannelsText()].filter(Boolean).join('\n');
+    const liveText = (await withTimeout(getLiveChannelsText(), 8000, 'always-read channels')) ?? '';
+    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText].filter(Boolean).join('\n');
 
     let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText);
 
