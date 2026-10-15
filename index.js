@@ -127,8 +127,10 @@ let searchBlockedUntil = 0;
 // Tiny web server so Render sees an open port
 // ---------------------------------------------------------------------------
 const webServer = http.createServer((request, response) => {
-    response.writeHead(200, { 'Content-Type': 'text/plain' });
-    response.end('Duro AI is active and running 24/7\n');
+    // 200 while the Discord connection works, 503 when it doesn't (so a monitor can tell)
+    const connected = client.isReady();
+    response.writeHead(connected ? 200 : 503, { 'Content-Type': 'text/plain' });
+    response.end(connected ? 'Duro AI is active and running 24/7\n' : 'Duro AI web server is up, but the Discord connection is down\n');
 });
 const serverPort = process.env.PORT || 10000;
 webServer.listen(serverPort, '0.0.0.0', () => {
@@ -2093,5 +2095,24 @@ const shutdown = async (signal) => {
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Watchdog: if the Discord connection stays broken (or stops answering) for several minutes, exit so Render restarts Duro by itself
+let brokenChecks = 0;
+setInterval(async () => {
+    let healthy = client.isReady();
+    if (healthy) {
+        // a real request to Discord, to catch a connection that looks open but is stuck
+        healthy = await Promise.race([
+            client.users.fetch(client.user.id, { force: true }).then(() => true).catch(() => false),
+            new Promise(resolve => setTimeout(() => resolve(false), 20_000))
+        ]);
+    }
+    brokenChecks = healthy ? 0 : brokenChecks + 1;
+    if (!healthy) console.warn(`Watchdog: the Discord connection is not working (${brokenChecks}/4)`);
+    if (brokenChecks >= 4) {
+        console.error('Watchdog: Discord connection stayed broken, restarting Duro...');
+        process.exit(1);
+    }
+}, 60_000);
 
 client.login(DISCORD_TOKEN);
