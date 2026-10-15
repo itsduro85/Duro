@@ -2119,6 +2119,22 @@ setInterval(async () => {
     }
 }, 60_000);
 
+// Direct check of Discord's API from this server: shows in the logs whether Discord answers, how fast, and any rate-limit info
+async function probeDiscord() {
+    const started = Date.now();
+    try {
+        const res = await fetch('https://discord.com/api/v10/gateway', { signal: AbortSignal.timeout(15_000) });
+        const body = (await res.text()).replace(/\s+/g, ' ').slice(0, 160);
+        console.log(`[probe] Discord API answered HTTP ${res.status} in ${Date.now() - started}ms (retry-after: ${res.headers.get('retry-after') ?? 'none'}, server: ${res.headers.get('server') ?? '?'}) ${body}`);
+    } catch (error) {
+        console.error(`[probe] Could not reach the Discord API after ${Date.now() - started}ms: ${error.name}: ${error.message}`);
+    }
+}
+probeDiscord();
+const probeTimer = setInterval(() => { if (client.isReady()) clearInterval(probeTimer); else probeDiscord(); }, 3 * 60_000);
+client.rest.on('rateLimited', info => console.warn(`[discord] Rate limited: ${info.method} ${info.route}, waiting ${Math.round(info.timeToReset / 1000)}s (global: ${info.global})`));
+client.rest.on('invalidRequestWarning', info => console.warn(`[discord] Invalid request warning: ${info.count} invalid requests in the current window`));
+
 // Connection diagnostics for the Render logs (so a slow or refused connection explains itself)
 client.on(Events.ShardError, error => console.error('Discord connection error:', error.message));
 client.on(Events.ShardDisconnect, (event, id) => console.warn(`Discord connection closed (shard ${id}, code ${event?.code}).`));
