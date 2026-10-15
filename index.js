@@ -2111,8 +2111,8 @@ setInterval(async () => {
         ]);
     }
     brokenChecks = healthy ? 0 : brokenChecks + 1;
-    const limit = wasReady ? 4 : 30; // never connected yet: wait up to 30 minutes
-    if (!healthy) console.warn(`Watchdog: the Discord connection is not working (${brokenChecks}/${limit})${wasReady ? '' : ', still waiting for the first connection'}`);
+    const limit = wasReady ? 4 : Infinity; // never connected yet: never restart (restarting adds more requests and can lengthen a block)
+    if (!healthy) console.warn(`Watchdog: the Discord connection is not working (${brokenChecks}${wasReady ? '/4' : ' minutes'})${wasReady ? '' : ', still waiting for the first connection'}`);
     if (brokenChecks >= limit) {
         console.error('Watchdog: Discord connection stayed broken, restarting Duro...');
         process.exit(1);
@@ -2131,7 +2131,7 @@ async function probeDiscord() {
     }
 }
 probeDiscord();
-const probeTimer = setInterval(() => { if (client.isReady()) clearInterval(probeTimer); else probeDiscord(); }, 3 * 60_000);
+// (only one check at startup: sending more requests while Discord blocks this server can make the block longer)
 client.rest.on('rateLimited', info => console.warn(`[discord] Rate limited: ${info.method} ${info.route}, waiting ${Math.round(info.timeToReset / 1000)}s (global: ${info.global})`));
 client.rest.on('invalidRequestWarning', info => console.warn(`[discord] Invalid request warning: ${info.count} invalid requests in the current window`));
 
