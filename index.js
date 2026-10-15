@@ -2096,10 +2096,13 @@ const shutdown = async (signal) => {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// Watchdog: if the Discord connection stays broken (or stops answering) for several minutes, exit so Render restarts Duro by itself
+// Watchdog: if the Discord connection breaks after it worked (or stops answering), exit after 4 minutes so Render restarts Duro by itself.
+// While Duro has never connected yet, it is NOT restarted early: connecting from Render can be slow, and restarting would only start the wait again.
 let brokenChecks = 0;
+let wasReady = false;
 setInterval(async () => {
     let healthy = client.isReady();
+    if (healthy) wasReady = true;
     if (healthy) {
         // a real request to Discord, to catch a connection that looks open but is stuck
         healthy = await Promise.race([
@@ -2108,11 +2111,26 @@ setInterval(async () => {
         ]);
     }
     brokenChecks = healthy ? 0 : brokenChecks + 1;
-    if (!healthy) console.warn(`Watchdog: the Discord connection is not working (${brokenChecks}/4)`);
-    if (brokenChecks >= 4) {
+    const limit = wasReady ? 4 : 30; // never connected yet: wait up to 30 minutes
+    if (!healthy) console.warn(`Watchdog: the Discord connection is not working (${brokenChecks}/${limit})${wasReady ? '' : ', still waiting for the first connection'}`);
+    if (brokenChecks >= limit) {
         console.error('Watchdog: Discord connection stayed broken, restarting Duro...');
         process.exit(1);
     }
 }, 60_000);
+
+// Connection diagnostics for the Render logs (so a slow or refused connection explains itself)
+client.on(Events.ShardError, error => console.error('Discord connection error:', error.message));
+client.on(Events.ShardDisconnect, (event, id) => console.warn(`Discord connection closed (shard ${id}, code ${event?.code}).`));
+client.on(Events.ShardReconnecting, id => console.warn(`Discord connection lost, reconnecting (shard ${id})...`));
+client.on(Events.Invalidated, () => console.error('Discord session was invalidated.'));
+client.on(Events.ShardReady, id => console.log(`Discord connection ready (shard ${id}).`));
+let debugLines = 0;
+client.on(Events.Debug, line => {
+    if (debugLines < 60 && /session|rate ?limit|429|invalid|identif|resum|close|connect|gateway|heartbeat/i.test(line)) {
+        debugLines++;
+        console.log(`[discord] ${line.slice(0, 300)}`);
+    }
+});
 
 client.login(DISCORD_TOKEN);
