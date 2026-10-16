@@ -383,7 +383,10 @@ function splitMessage(text, max = DISCORD_CHUNK_SIZE) {
 
 // Which attachments Duro can read: pictures, PDFs and text/code files
 const TEXT_FILE_PATTERN = /\.(txt|md|csv|tsv|json|jsonl|xml|html?|css|js|mjs|ts|jsx|tsx|py|java|c|cpp|cs|go|rs|php|rb|sh|sql|yml|yaml|toml|ini|log|env|lua|kt|swift)$/i;
-const MAX_FILE_BYTES = 15 * 1024 * 1024;   // PDFs and pictures
+// Render's free plan has only 512 MB of memory and a picture is copied several times while it is sent, so the limits are small
+const MAX_FILE_BYTES = 5 * 1024 * 1024;    // one picture or PDF
+const MAX_TOTAL_FILE_BYTES = 8 * 1024 * 1024; // all pictures and PDFs of one message together
+const MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024;  // one text or code file
 const MAX_TEXT_CHARS = 60_000;             // text files are cut after this many characters
 
 function attachmentKind(a) {
@@ -404,12 +407,15 @@ async function buildAttachmentParts(attachments) {
     const files = [...attachments.values()].filter(a => attachmentKind(a)).slice(0, MAX_IMAGES_PER_MESSAGE);
 
     const parts = [];
+    let totalBytes = 0;
     for (const file of files) {
         const kind = attachmentKind(file);
-        if (kind !== 'text' && file.size > MAX_FILE_BYTES) {
-            parts.push({ text: `[The file "${file.name}" is too big for me to read (over 15 MB).]` });
+        const limit = kind === 'text' ? MAX_TEXT_FILE_BYTES : MAX_FILE_BYTES;
+        if (file.size > limit || (kind !== 'text' && totalBytes + file.size > MAX_TOTAL_FILE_BYTES)) {
+            parts.push({ text: `[The file "${file.name}" is too big for me to read (the limit is ${Math.round(limit / 1048576)} MB per file, ${Math.round(MAX_TOTAL_FILE_BYTES / 1048576)} MB per message). Tell the person to send a smaller or compressed version.]` });
             continue;
         }
+        if (kind !== 'text') totalBytes += file.size;
         try {
             const res = await fetch(file.url, { signal: AbortSignal.timeout(25_000) });
             if (!res.ok) continue;
@@ -431,6 +437,7 @@ async function buildAttachmentParts(attachments) {
             console.warn(`Could not download attachment ${file.name}:`, err.message);
         }
     }
+    if (files.length) console.log(`[memory] after reading ${files.length} attachment(s): ${Math.round(process.memoryUsage().rss / 1048576)} MB used`);
     return parts;
 }
 
@@ -453,7 +460,7 @@ async function requestGemini(model, contents, withSearch, hasWebResults, senderR
             'x-goog-api-key': GEMINI_API_KEY // key in a header, not in the URL, so it never leaks into logs
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(JSON.stringify(contents).includes('"inlineData"') ? REQUEST_TIMEOUT_MS : TEXT_REQUEST_TIMEOUT_MS)
+        signal: AbortSignal.timeout(contents.some(entry => entry.parts?.some(part => part.inlineData)) ? REQUEST_TIMEOUT_MS : TEXT_REQUEST_TIMEOUT_MS)
     });
 
     const raw = await response.text();
@@ -2086,6 +2093,14 @@ client.on(Events.MessageCreate, async (message) => {
 // ---------------------------------------------------------------------------
 client.on(Events.Error, error => console.error('Discord client error:', error));
 process.on('unhandledRejection', reason => console.error('Unhandled rejection:', reason));
+// A stray error must never take the whole bot down (a restart means a new Discord login, and too many logins get the server blocked)
+process.on('uncaughtException', error => console.error('Uncaught exception (Duro keeps running):', error));
+// Memory use every 5 minutes: if Duro ever crashes, the last line shows whether memory (Render's free limit is 512 MB) was the cause
+setInterval(() => {
+    const mb = bytes => Math.round(bytes / 1048576);
+    const { rss, heapUsed } = process.memoryUsage();
+    console.log(`[memory] ${mb(rss)} MB used by Duro (heap ${mb(heapUsed)} MB), limit on Render free is 512 MB`);
+}, 5 * 60_000);
 
 const shutdown = async (signal) => {
     console.log(`${signal} received, shutting down...`);
