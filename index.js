@@ -308,19 +308,101 @@ function needsWebSearch(text) {
     return FRESH_INFO_PATTERN.test(text);
 }
 
+// Removes the "Name [role]:" label Duro keeps in front of the messages it remembers
+function plainHistoryText(entry) {
+    const text = entry.parts?.[0]?.text ?? '';
+    return (entry.role === 'user' ? text.replace(/^[^:\n]{1,60}:\s*/, '') : text).replace(/\s+/g, ' ').trim();
+}
+
+// Decides if the newest message needs a look-up on the internet and, if so, writes a clean search query from the whole recent chat.
+// Follow-ups like "When it's coming?", "In which month?", "search again" never say WHAT they are about: the topic is in the earlier
+// messages (e.g. "GIF system is coming to YouTube comments!" several messages back), so Gemini reads the chat and finds it.
+// Returns the query, "" when nothing needs looking up, or null if Gemini couldn't do it (the caller then uses a simpler method)
+async function planWebSearch(userText, history, explicit) {
+    const model = MODEL_CHAIN.find(name => !isResting(name));
+    if (!model) return null;
+
+    const recent = history.map(entry => `${entry.role === 'model' ? 'Duro' : 'Person'}: ${plainHistoryText(entry).slice(0, 300)}`).join('\n');
+
+    const prompt =
+        'You decide whether a chat assistant should look something up on the internet, and you write the search query.\n' +
+        'Below is the recent chat and the person\'s NEWEST message.\n' +
+        '- Look things up when the answer can change or the assistant may not know it: news, announcements, release dates, prices, scores, ' +
+        'who currently holds a role, new products, games or features.\n' +
+        '- Do NOT look up chit-chat, opinions, jokes, coding help, math, definitions, or questions about the chat itself. For those reply exactly NONE.\n' +
+        '- The newest message is often a follow-up ("when?", "in which month?", "is it out?", "search again"). Then the topic is whatever the chat was ' +
+        'about: find it in the earlier messages (the person\'s own earlier messages usually name it) and put the topic itself in the query.\n' +
+        '- If the newest message is complete on its own, use only it.\n' +
+        '- Write ONE query of at most 15 words, no quotes. Never put words about searching itself in it (search, internet, google, tavily, look up, again, bro).\n' +
+        (explicit ? '- The person explicitly asked to search the internet, so NEVER answer NONE: search for the topic being discussed.\n' : '') +
+        'Reply with the query only (or NONE).\n\n' +
+        `Recent chat:\n${recent || '(none)'}\n\nNEWEST message: ${userText.replace(/\s+/g, ' ').slice(0, 400)}`;
+
+    try {
+        const response = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+            body: JSON.stringify({
+                contents: [{ role: 'user', parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0, maxOutputTokens: 256 }
+            }),
+            signal: AbortSignal.timeout(6_000)
+        });
+        const data = await response.json().catch(() => null);
+        if (!response.ok) {
+            restModel(model, new GeminiError(data?.error?.message || `HTTP ${response.status}`, response.status));
+            return null;
+        }
+        const text = (data?.candidates?.[0]?.content?.parts || [])
+            .filter(part => part.text && !part.thought)
+            .map(part => part.text)
+            .join('')
+            .split('\n')[0]
+            .replace(/^["'`\s]+|["'`\s]+$/g, '')
+            .trim();
+        if (!text) return null;
+        if (/^none\.?$/i.test(text)) return '';
+        return text.slice(0, 300);
+    } catch (err) {
+        console.warn('Search planning skipped:', err.message);
+        return null;
+    }
+}
+
+// Words where the person clearly asks Duro to search ("search internet", "check online", "look it up")
+const EXPLICIT_SEARCH_PATTERN = /\b(search|google|internet|online|web|look ?up|tavily|check (it|that|this))\b/i;
+// Short follow-ups that ask for a fact ("When it's coming?", "In which month?", "how many?"), even without trigger words like "latest"
+const FACT_QUESTION_PATTERN = /\b(when|which|where|who|whose|how (many|much|long|old|far|soon)|what (date|time|day|month|year|price|score))\b/i;
+
 // Look the question up with Tavily and return the results as text for Gemini (empty string = no results)
 async function getWebResults(userText, history) {
-    if (!needsWebSearch(userText)) return '';
+    if (!WEB_SEARCH_ENABLED) return '';
 
-    // Follow-ups like "and how many subscribers?" or "how many does he have?" don't say WHO or WHAT they are about,
-    // so borrow the previous question for context (short messages, or messages with words like he/she/it/they)
-    let query = userText;
     const isShort = userText.split(/\s+/).length < 8;
     const hasPronoun = /\b(he|she|it|its|they|them|their|him|his|her|that|this|those|these|there)\b/i.test(userText);
-    if (isShort || hasPronoun) {
-        const lastUser = [...history].reverse().find(entry => entry.role === 'user');
-        const lastText = lastUser?.parts?.[0]?.text?.replace(/^[^:]{1,40}:\s*/, '');
-        if (lastText) query = `${lastText.slice(0, 200)} ${userText}`;
+    const needsContext = isShort || hasPronoun;                 // may not say WHAT it is about
+    const flagged = needsWebSearch(userText);                    // has trigger words (latest, price, search, ...)
+    const factFollowUp = needsContext && FACT_QUESTION_PATTERN.test(userText);
+    if (!flagged && !factFollowUp) return '';
+
+    // Long, complete questions are searched as they are. Short ones and ones with he/she/it/they get Gemini's help:
+    // it reads the recent chat, finds the topic, and writes the query (or says no search is needed).
+    let query = userText;
+    if (needsContext) {
+        const planned = await planWebSearch(userText, history, EXPLICIT_SEARCH_PATTERN.test(userText));
+        if (planned === '') return '';          // nothing to look up
+        if (planned) {
+            query = planned;
+        } else {
+            // Gemini couldn't help (busy or slow). Messages without trigger words are not worth a blind search.
+            if (!flagged) return '';
+            // Simple method: the person's last 3 messages give the topic; filler words about searching are removed
+            const earlier = history.filter(entry => entry.role === 'user').slice(-3).map(entry => plainHistoryText(entry).slice(0, 150));
+            query = `${earlier.join(' ')} ${userText}`
+                .replace(/\b(tavily|go through|searching|search|internet|google|look ?up|again|bro|please|pls)\b/gi, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+        }
     }
     // Searching for the "latest"/"current" thing works much better when the search engine knows today's date
     const wantsLatest = /\b(latest|newest|current|currently|recent|recently|now|today|new|update|release|version|season|news)\b/i.test(query);
@@ -2009,6 +2091,144 @@ function shouldIgnoreMessage(message, hasImages) {
 }
 
 // ---------------------------------------------------------------------------
+// Short, natural reactions when someone calls Duro without asking anything
+// ("@Duro", "@Duro I have a question", "@Duro listen", "@Duro tell me", "@Duro are you there?").
+// This is decided in code (no AI request), so it is instant and costs no quota.
+// ---------------------------------------------------------------------------
+const QUICK_CONTEXT_MS = 3 * 60 * 1000; // if Duro just answered this person, a short fragment is probably a follow-up, so the AI handles it
+
+// Which kind of "call" is this message? Returns null when it is a real message (then the AI answers as usual)
+const QUICK_GREETING_RE = /^(?:hi+|hii+|hello+|hey+|hy|yo+|sup|wassup|wazzup|hola|salam|salaam|assalamu alaikum|assalamualaikum|good (?:morning|afternoon|evening|night)|whats up|wats up|whats good)(?: (?:there|man|bro|dude|buddy|everyone|guys|all))?$/;
+const QUICK_EMPTY_RE = /^(?:um+|uh+|hm+|hmm+|ay+|eh+|oi+|oy+|bro|bruh|dude|man|boss|sir|hello|yo)$/;
+const QUICK_FILLER_RE = /^(?:(?:hey+|hi+|hello+|yo+|oi+|oy+|ok|okay|so|um+|uh+|well|bro|dude|man|please|pls|plz|hmm+|hm+)\s+)+(?=\S)/;
+const QUICK_LISTEN_RE = /^(?:listen|listen to me|listen up|hear me|hear me out|look|look here|see|wait|wait a sec|wait a second|one sec|one second|hold on|attention|pay attention|check this|check this out|read this|focus|watch this|excuse me|pst|psst|(?:can|could) you (?:hear|listen)(?: to)?(?: me)?|are you listening|you listening|did you hear)$/;
+const QUICK_PRESENCE_RE = /^(?:(?:are )?(?:you|u|ya)(?: still)?(?: there| here| online| alive| awake| up| active| working| ok| okay| around| available)|(?:is )?(?:anyone|anybody|someone) (?:there|here|online)|still (?:there|here|online|alive)|there|online|alive|awake|ping|test|testing|status|working)$/;
+const QUICK_INTRO_RE = /^(?:(?:i |we )?(?:have|got|had|hv|gotta|need|want to|wanna) (?:a |an |one |some |another )?(?:quick |small |little |short )?(?:question|doubt|query|problem|issue)s?|(?:can|could|may) (?:i|we) (?:ask|ask you|ask something|ask a question|ask you something|ask you a question)|(?:i |we )?(?:want to|wanna|would like to|need to|have to|gotta) ask(?: you)?(?: (?:something|a question|one thing))?|ask you something|ask something|question|quick question|small question|one question|a question|doubt|need help|i need help|help|help me|i need some help|can you help|can you help me|could you help me|need your help|i need your help|got a minute|got a sec|are you free|you free|free)$/;
+const QUICK_INCOMPLETE = new Set([
+    'tell me', 'tell', 'tell me about', 'tell me something about',
+    'what', 'what is', 'what is the', 'what is a', 'what is an', 'what are', 'what are the', 'what do', 'what does', 'what did', 'what can', 'what about', 'whats', 'whats the',
+    'how', 'how to', 'how do', 'how do i', 'how do you', 'how can', 'how can i', 'how does', 'how did', 'how is', 'how are', 'how many', 'how much', 'how long',
+    'why', 'why is', 'why do', 'why does', 'why did', 'why are',
+    'who', 'who is', 'who are', 'who was', 'whose',
+    'when', 'when is', 'when did', 'when does', 'when will',
+    'where', 'where is', 'where are', 'where can', 'where do', 'where did',
+    'which', 'which is',
+    'is it', 'is', 'is this', 'is that', 'is there', 'are', 'are there', 'are they', 'was', 'were', 'will', 'will it', 'would', 'could', 'should', 'should i',
+    'can', 'can i', 'can you', 'can you tell me', 'could you', 'could you tell me', 'will you', 'would you',
+    'do', 'do you', 'do you know', 'does', 'does it', 'did', 'did you', 'did you know',
+    'explain', 'explain me', 'explain to me', 'give me', 'show me', 'i want to know', 'i wanna know', 'i need to know', 'let me know',
+    'i was wondering', 'im wondering', 'i wonder', 'i think', 'i mean', 'so', 'and', 'but', 'because', 'also', 'then', 'about', 'regarding'
+]);
+
+// Lowercase, without mentions, emoji, punctuation and the word "duro", so "@Duro, I have a question!!" becomes "i have a question"
+function normalizeForQuick(text) {
+    return text.toLowerCase()
+        .replace(/<a?:\w+:\d+>/g, ' ')
+        .replace(/<[@#&!][^>]*>/g, ' ')
+        .replace(/\bduro\b/g, ' ')
+        .replace(/['’]/g, '')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function classifyQuickCall(spokenText, recentlyAnswered) {
+    const t = normalizeForQuick(spokenText);
+    if (!t) return 'empty';
+    if (t.split(' ').length > 9) return null;
+    if (QUICK_GREETING_RE.test(t)) return 'greeting';
+    if (QUICK_EMPTY_RE.test(t)) return 'empty';
+    const core = t.replace(QUICK_FILLER_RE, '');
+    if (QUICK_LISTEN_RE.test(core)) return 'listen';
+    if (QUICK_PRESENCE_RE.test(core)) return 'presence';
+    if (QUICK_INTRO_RE.test(core)) return 'intro';
+    if (!recentlyAnswered && QUICK_INCOMPLETE.has(core)) return 'incomplete';
+    return null;
+}
+
+// Possible reactions per kind. {user} becomes a mention of the person (it shows their name and pings nobody).
+const QUICK_REPLIES = {
+    empty: {
+        text: ['?', 'What?', 'Yes?', 'hmm?', 'say', 'tell', 'ask', 'listening', "I'm listening", "I'm online", "I'm here", 'yes?', 'yep?', 'go on', "what's up?", 'hm?', 'yeah?', 'speak', 'sup?', 'here', 'say it', 'ask away', 'what is it?', 'need something?', 'you called?', "I'm all ears", 'go ahead',
+            'tell {user}', 'ask {user}', 'yes {user}?', 'yes, {user}?', 'hmm? {user}', '{user}?', "what's up {user}?"],
+        emoji: ['❓', '❔', '🤔', '👀', '👂', '🙋', '🧐', '🤨', '🫡', '😶', '🙂', '👋', '💭'],
+        combos: ['🤔❓', '👀❓', '❓❓', '🙋❓', '👂👀']
+    },
+    intro: {
+        text: ['what?', 'What is it?', 'ask', 'ask away', 'go ahead', 'go on', 'shoot', 'sure, ask', 'yes, ask', 'tell me', 'tell', 'yes?', "what's the question?", 'ask me', 'okay, ask', "I'm listening", 'what do you want to know?', 'sure', 'go for it', "what's it about?", 'ask it', 'yep, go ahead',
+            'ask {user}', 'yes {user}, ask', 'sure {user}, ask'],
+        emoji: ['🤔', '❓', '👂', '🙋', '👀', '🧐', '💭', '🙂', '👍'],
+        combos: ['🤔❓', '🤔💭', '👀❓', '🙋❓']
+    },
+    listen: {
+        text: ['listening', "I'm listening", 'hmm?', 'yes', 'yes?', 'go on', 'go ahead', 'I hear you', "I'm all ears", 'say it', 'yep', "I'm here", 'hm?', 'okay, listening', 'speak', 'tell', 'continue', "yes, I'm listening", "go on, I'm listening", 'hearing you', 'yes {user}?', 'go on {user}'],
+        emoji: ['👂', '👀', '🙂', '🤔', '🫡', '💭', '👍'],
+        combos: ['👂👀', '👂🙂', '🤔👂']
+    },
+    presence: {
+        text: ['yes', 'yep', 'yes?', "I'm here", 'here', "I'm online", 'online', "yeah, I'm here", 'still here', 'right here', 'always here', "I'm awake", 'alive', 'yup', "yes, what's up?", "here, what's up?", "I'm up", "yep, I'm online", "what's up?", 'you called?', 'yes {user}, I am here', 'here {user}'],
+        emoji: ['👋', '🙋', '✅', '🙂', '😄', '🟢', '🫡', '👀', '😎', '🤖'],
+        combos: ['✅🙂', '🙋✅', '👋🙂']
+    },
+    greeting: {
+        text: ['hey', 'hi', 'hello', 'yo', 'hey there', 'hi there', 'sup?', "what's up?", "hey, what's up?", 'hello!', 'heyy', "yo, what's up?", 'hii', 'hey, need something?', 'hi, say it', 'hi {user}', 'hey {user}', 'hello {user}', 'yo {user}'],
+        emoji: ['👋', '🙂', '😄', '😁', '🤝', '🫡', '😎', '✌️', '🙌', '👀'],
+        combos: ['👋🙂', '👋😄', '🙌👋']
+    },
+    incomplete: {
+        text: ['what?', '?', 'continue', 'go on', 'and?', 'finish it', 'keep going', 'yes, continue', 'continue...', 'complete it', 'you stopped there', '...?', 'tell me fully', 'what about it?', 'and then?', "what's the rest?", 'the rest?', 'what exactly?', 'finish the question', 'I think you forgot the rest', 'message got cut?', 'and...?', 'so?', 'what do you want to know?', 'continue {user}'],
+        emoji: ['❓', '🤔', '🤨', '🧐', '👀', '😅', '😶', '💭', '❔', '🤷'],
+        combos: ['🤔❓', '❓❓', '🤨❓', '👀❓']
+    }
+};
+
+const lastQuickReply = new Map(); // channel -> last reaction, so Duro doesn't say the same thing twice in a row
+const pickRandom = list => list[Math.floor(Math.random() * list.length)];
+
+// Builds one reaction: only text (about half the time), only emoji, or text with an emoji, never the same as the last one in that channel
+function makeQuickReply(kind, userId, channelId) {
+    const pool = QUICK_REPLIES[kind];
+    let reply = '';
+    for (let attempt = 0; attempt < 8; attempt++) {
+        const roll = Math.random();
+        const emoji = () => (Math.random() < 0.25 ? pickRandom(pool.combos) : pickRandom(pool.emoji));
+        if (roll < 0.45) {
+            reply = pickRandom(pool.text);                                                   // only text
+        } else if (roll < 0.70) {
+            reply = emoji();                                                                  // only emoji
+        } else {
+            reply = `${pickRandom(pool.text.filter(text => !text.includes('{user}')))}${Math.random() < 0.25 ? '' : ' '}${emoji()}`; // text + emoji ("what?🤔" or "what? 🤔")
+        }
+        reply = reply.replace(/\{user\}/g, `<@${userId}>`);
+        if (reply !== lastQuickReply.get(channelId)) break;
+    }
+    lastQuickReply.set(channelId, reply);
+    return reply;
+}
+
+async function sendQuickReply(message, kind, spokenText) {
+    usersBeingAnswered.add(message.author.id);
+    try {
+        const reply = makeQuickReply(kind, message.author.id, message.channel.id);
+        // A short "typing..." pause makes it feel like a person answering instead of an instant bot
+        message.channel.sendTyping().catch(() => {});
+        await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 1000));
+        await message.reply({ content: reply, allowedMentions: { parse: [], repliedUser: false } });
+
+        // Remember the exchange, so the next message ("what is the capital of France?") still has its context
+        const author = message.member?.displayName || message.author.username;
+        const role = getSenderRole(message.author, message.member?.permissions, message.guild);
+        addToHistory(message.channel.id, 'user', `${author} [${role}]: ${spokenText || '(called Duro without a question)'}`);
+        addToHistory(message.channel.id, 'model', reply.replace(/<@\d+>/g, author));
+        console.log(`Quick reply (${kind}) to ${author}: ${reply}`);
+    } catch (error) {
+        console.error('Quick reply failed:', error.message);
+    } finally {
+        usersBeingAnswered.delete(message.author.id);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chat messages
 // ---------------------------------------------------------------------------
 client.on(Events.MessageCreate, async (message) => {
@@ -2025,16 +2245,14 @@ client.on(Events.MessageCreate, async (message) => {
 
     const hasImages = hasReadableAttachment(message.attachments); // pictures, PDFs and text files
     const spokenText = mentioned ? message.content.replace(mentionPattern, '').trim() : message.content.trim();
-    if (!spokenText && !hasImages) {
-        // Only "@Duro" with nothing else
-        if (mentioned) await message.reply({ content: `Hi ${message.member?.displayName || message.author.username}! Ask me anything.`, allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
-        return;
-    }
+    // Is the message talking to Duro? An @mention anywhere, or the name "Duro" inside an AI channel
+    const addressed = mentioned || (inAiChannel && /\bduro\b/i.test(message.content));
+    if (!spokenText && !hasImages && !mentioned) return;
 
     // In an AI channel, messages that mean nothing (random emoji, GIF or link only, "ok", "lol", gibberish)
     // are removed, unless they react to something Duro said. Staff are never touched.
     // A message that mentions @Duro is addressed to Duro, so it is never removed.
-    if (inAiChannel && !mentioned && !hasImages && !isStaff(message.member)) {
+    if (inAiChannel && !addressed && !hasImages && !isStaff(message.member)) {
         const meaningless = nonsenseReason(message.content);
         if (meaningless && !(await pointsAtDuro(message))) {
             await message.delete().catch(() => {});
@@ -2049,6 +2267,17 @@ client.on(Events.MessageCreate, async (message) => {
         console.log(`Ignored a message from ${message.author.username}: ${ignoreReason}`);
         return;
     }
+
+    // Called without a real question ("@Duro", "@Duro I have a question", "@Duro listen", "@Duro tell me"): a very short, natural reaction
+    if (addressed && !hasImages) {
+        const recentlyAnswered = Date.now() - (duroSpokeTo.get(`${message.channel.id}:${message.author.id}`) ?? 0) < QUICK_CONTEXT_MS;
+        const quickKind = classifyQuickCall(spokenText, recentlyAnswered);
+        if (quickKind) {
+            await sendQuickReply(message, quickKind, spokenText);
+            return;
+        }
+    }
+
     usersBeingAnswered.add(message.author.id);
 
     // Discord's typing indicator lasts ~10 seconds, so refresh it while waiting for the AI
