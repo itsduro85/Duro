@@ -2229,6 +2229,57 @@ async function sendQuickReply(message, kind, spokenText) {
 }
 
 // ---------------------------------------------------------------------------
+// Sometimes Duro reacts with an emoji to messages that talk ABOUT it ("duro is smart", "where is duro?", "hey duro").
+// Only plain messages in channels where Duro doesn't chat (an @mention or an AI channel gets a real answer instead).
+// Decided in code: no AI request, no quota.
+// ---------------------------------------------------------------------------
+const REACT_CHANCE = Math.min(1, Math.max(0, Number(process.env.REACT_CHANCE ?? 0.35))); // 0.35 = about 1 in 3 messages (set REACT_CHANCE=0 to turn off)
+const REACT_COOLDOWN_MS = 45 * 1000;                                                        // at most one reaction per channel every 45 seconds
+const lastReactionInChannel = new Map();
+
+// Which emoji fits the message? Checked in this order; the first match wins
+const REACTION_RULES = [
+    { match: /\b(dumb|stupid|bad|trash|useless|hate|idiot|worst|broken|annoying|cringe|boring|garbage|noob|sucks?)\b/i, emoji: ['😅', '🥲', '😢', '😭', '🤨', '😶', '💀', '🫠'] },
+    { match: /\b(good|best|smart|clever|cool|awesome|love|great|nice|op|goat|legend|amazing|fire|thanks?|thx|helpful|genius|king|wow|perfect|brilliant)\b/i, emoji: ['😎', '❤️', '🔥', '👍', '🙌', '😄', '🫡', '🥰', '💯', '😊'] },
+    { match: /\b(lol|lmao|lmfao|haha+|hehe+|funny|joke)\b|😂|🤣/i, emoji: ['😂', '🤣', '💀', '😆', '😄'] },
+    { match: /\b(hi|hii+|hello+|hey+|yo|sup|salam|morning|evening)\b/i, emoji: ['👋', '🙂', '😄', '🙌', '🫡'] },
+    { match: /\?|\b(where|why|how|what|who|when|which|is|are|can|does)\b/i, emoji: ['👀', '🤔', '🙋', '🧐', '💭', '👂'] }
+];
+const DEFAULT_REACTIONS = ['👀', '🙂', '🫡', '😄', '👍', '🤖', '😎', '👋'];
+
+function pickReactionEmojis(text) {
+    const rule = REACTION_RULES.find(entry => entry.match.test(text));
+    const pool = rule ? rule.emoji : DEFAULT_REACTIONS;
+    const first = pickRandom(pool);
+    const emojis = [first];
+    if (Math.random() < 0.15) {                        // now and then two reactions
+        const second = pickRandom(pool.filter(emoji => emoji !== first));
+        if (second) emojis.push(second);
+    }
+    return emojis;
+}
+
+async function maybeReactToDuroMention(message) {
+    if (!message.guild || !/\bduro\b/i.test(message.content)) return;
+    if (Math.random() >= REACT_CHANCE) return;
+    if (Date.now() - (lastReactionInChannel.get(message.channel.id) ?? 0) < REACT_COOLDOWN_MS) return;
+
+    const me = message.guild.members.me;
+    if (!me || !message.channel.permissionsFor(me)?.has([PermissionFlagsBits.AddReactions, PermissionFlagsBits.ReadMessageHistory])) return;
+    lastReactionInChannel.set(message.channel.id, Date.now());
+
+    // A short pause, like a person noticing the message
+    await new Promise(resolve => setTimeout(resolve, 800 + Math.random() * 2500));
+    try {
+        const emojis = pickReactionEmojis(message.content);
+        for (const emoji of emojis) await message.react(emoji);
+        console.log(`Reacted ${emojis.join('')} to a message from ${message.author.username} in #${message.channel.name ?? message.channel.id}`);
+    } catch (error) {
+        console.log(`Couldn't react: ${error.message}`);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chat messages
 // ---------------------------------------------------------------------------
 client.on(Events.MessageCreate, async (message) => {
@@ -2241,7 +2292,11 @@ client.on(Events.MessageCreate, async (message) => {
     const mentionPattern = new RegExp(`<@!?${client.user.id}>`, 'g');
     const mentioned = message.mentions.users.has(client.user.id) && !message.mentions.everyone;
     const inAiChannel = activeChannels.has(message.channel.id);
-    if (!inAiChannel && !mentioned) return;
+    if (!inAiChannel && !mentioned) {
+        // Not talking to Duro, but maybe talking about it ("duro is smart"): sometimes react with an emoji
+        maybeReactToDuroMention(message).catch(() => {});
+        return;
+    }
 
     const hasImages = hasReadableAttachment(message.attachments); // pictures, PDFs and text files
     const spokenText = mentioned ? message.content.replace(mentionPattern, '').trim() : message.content.trim();
