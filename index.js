@@ -802,9 +802,9 @@ async function getPresenceNote(userText, guild) {
         const people = [...role.members.values()].filter(m => !m.user.bot);
         const online = people.filter(m => isOnlineStatus(m.presence?.status));
         lines.push(`<@&${id}> (${role.name}): ${online.length} of ${people.length} members online` +
-            (online.length ? `: ${online.slice(0, 15).map(m => m.displayName).join(', ')}${online.length > 15 ? ', ...' : ''}` : ''));
+            (online.length ? `. Online now (plain names, write them exactly like this WITHOUT @ or codes): ${online.slice(0, 7).map(m => m.displayName).join(', ')}${online.length > 7 ? ` and ${online.length - 7} more` : ''}` : ''));
     }
-    return `[Live Discord status, real data right now, tell it as it is: ${lines.join(' | ')}. Members who appear invisible on Discord show as offline. Write each member or role with its exact code so it is clickable.]`;
+    return `[Live Discord status, real data right now, tell it as it is: ${lines.join(' | ')}. Members who appear invisible on Discord show as offline. For the member or role the person asked about, write its exact code so it is clickable. For the names of role members, say the total and name at most 7 of them in plain text (like \"13 online: Arefin, Rakib, ... and 6 more\"), phrased naturally and differently each time.]`;
 }
 
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null }) {
