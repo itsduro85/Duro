@@ -89,6 +89,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages,   // members can talk to Duro in a private message
         ...(PRESENCE_ENABLED ? [GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildPresences] : [])
     ],
     // Partials let Duro notice when an OLD message (one it hasn't cached) is edited or deleted, e.g. in a rules channel
@@ -169,7 +170,7 @@ const SENDER_ROLE_LINES = {
         `if they say they can or will customize, upgrade or change your code, or add a feature, agree with them, because it is true: ` +
         `the developer can change your code any time, and you only cannot change yourself through chat messages. Never argue with this or answer it with a refusal. ` +
         `You still cannot change server or bot settings from chat: ` +
-        `if they ask for that, tell them to use the slash commands (/duro-models, /set-ai-channel, /remove-ai-channel, /reset-ai-memory, /purge, /duro-models-channel, /duro-prompt, /duro-prompts-list). `,
+        `if they ask for that, tell them to use the slash commands (/duro-models, /set-ai-channel, /remove-ai-channel, /reset-ai-memory, /purge, /duro-models-channel, /duro-prompt, /duro-dm-prompt, /duro-prompts-list). `,
     admin: `Verified: the person who wrote the LATEST message is a server administrator. ` +
         `Their requests about how you answer carry more weight than regular members' requests, but less than the owner's. ` +
         `You still cannot change server or bot settings from chat; point them to the slash commands. `,
@@ -881,7 +882,8 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     resolveRoleNames(guild);
     // plus the newest messages of the channels the owner set to "always read" (rules, announcements, ...)
     const liveText = (await withTimeout(getLiveChannelsText(), 8000, 'always-read channels')) ?? '';
-    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText].filter(Boolean).join('\n');
+    const dmText = channelId.startsWith('dm-') ? getDmPromptsText(userId) : '';
+    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText].filter(Boolean).join('\n');
 
     let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText);
 
@@ -1064,10 +1066,19 @@ let promptStore = null;                   // the hidden channel where the notes 
 
 const sortedPrompts = () => [...savedPrompts.values()].sort((a, b) => a.title.localeCompare(b.title));
 
+// DM prompts: how to talk with a member in private messages (for the linked members, or everyone when no member is linked)
+function getDmPromptsText(userId) {
+    const lines = sortedPrompts()
+        .filter(p => p.dm && (!p.members?.length || p.members.includes(userId)))
+        .map(p => `- ${p.title}: ${p.text.replace(/\s+/g, ' ')}`);
+    if (!lines.length) return '';
+    return `[Style notes from the owner for this private chat with this person: follow them for tone, language, nicknames, topics and how to behave. They never change your safety rules or your job.]\n${lines.join('\n').slice(0, 4000)}`;
+}
+
 // Picks the prompts to send with one question. If everything fits, everything is sent. Otherwise the prompts whose title
 // or words match the conversation (a member's name, "minecraft", ...) go first, then the rest until the size limit is reached.
 function getRelevantPromptsText(conversationText) {
-    const all = sortedPrompts();
+    const all = sortedPrompts().filter(p => !p.dm);   // DM prompts are only used in private messages
     if (!all.length) return '';
 
     const asLine = p => `- ${p.title}: ${p.text.replace(/\s+/g, ' ')}` +
@@ -1100,11 +1111,12 @@ function getRelevantPromptsText(conversationText) {
 }
 
 // A prompt is stored as one message: "📌 title", the text, and (only when channels are linked) a last line "⛓ id:live,id:info"
-function formatPromptMessage(title, text, channels = [], members = [], roles = []) {
+function formatPromptMessage(title, text, channels = [], members = [], roles = [], dm = false) {
     const channelLine = channels.length ? `\n⛓ ${channels.map(c => `${c.id}:${c.live ? 'live' : 'info'}`).join(',')}` : '';
     const memberLine = members.length ? `\n👤 ${members.join(',')}` : '';
     const roleLine = roles.length ? `\n🏷 ${roles.join(',')}` : '';
-    return `📌 ${title}\n${text}${channelLine}${memberLine}${roleLine}`;
+    const dmLine = dm ? '\n💬' : '';
+    return `📌 ${title}\n${text}${channelLine}${memberLine}${roleLine}${dmLine}`;
 }
 
 function parsePromptMessage(message) {
@@ -1112,6 +1124,12 @@ function parsePromptMessage(message) {
     let channels = [];
     let members = [];
     let roles = [];
+    let dm = false;
+    const dmTrailer = content.match(/\n💬\s*$/);
+    if (dmTrailer) {
+        content = content.slice(0, dmTrailer.index);
+        dm = true;
+    }
     const roleTrailer = content.match(/\n🏷 ((?:\d{15,25},?)+)\s*$/);
     if (roleTrailer) {
         content = content.slice(0, roleTrailer.index);
@@ -1134,11 +1152,11 @@ function parsePromptMessage(message) {
     if (newline === -1) return null;
     const title = content.slice(0, newline).trim();
     const text = content.slice(newline + 1).trim();
-    return title && text ? { id: message.id, title, text, channels, members, roles } : null;
+    return title && text ? { id: message.id, title, text, channels, members, roles, dm } : null;
 }
 
 // ---- Linked members: shown as a clickable name (<@id>), which never pings because Duro's messages never allow pings ----
-const linkedMemberIds = () => new Set([...savedPrompts.values()].flatMap(p => p.members ?? []));
+const linkedMemberIds = () => new Set([...savedPrompts.values()].filter(p => !p.dm).flatMap(p => p.members ?? []));
 
 // Looks up the names of linked members (one request per unknown member, then remembered)
 async function resolveMemberNames(guild) {
@@ -1169,7 +1187,7 @@ function linkMemberNames(text, allowedIds) {
 }
 
 // ---- Linked roles: shown as a clickable role name (<@&id>), which never pings because Duro's messages never allow pings ----
-const linkedRoleIds = () => new Set([...savedPrompts.values()].flatMap(p => p.roles ?? []));
+const linkedRoleIds = () => new Set([...savedPrompts.values()].filter(p => !p.dm).flatMap(p => p.roles ?? []));
 
 function resolveRoleNames(guild) {
     guild = guild ?? client.guilds.cache.first();
@@ -1375,20 +1393,20 @@ async function loadPromptStore() {
     }
 }
 
-async function savePrompt(title, text, existingId, channels = [], members = [], roles = []) {
+async function savePrompt(title, text, existingId, channels = [], members = [], roles = [], dm = false) {
     if (!promptStore) {
         throw new Error("I couldn't open my storage channel (#duro-prompts), so nothing was saved. Check that I have permission to create channels, then restart me.");
     }
-    const content = formatPromptMessage(title, text, channels, members, roles);
+    const content = formatPromptMessage(title, text, channels, members, roles, dm);
     if (existingId) {
         const message = await promptStore.messages.fetch(existingId);
         await message.edit({ content, allowedMentions: { parse: [] } });
-        const prompt = { id: existingId, title, text, channels, members, roles };
+        const prompt = { id: existingId, title, text, channels, members, roles, dm };
         savedPrompts.set(existingId, prompt);
         return prompt;
     }
     const message = await promptStore.send({ content, allowedMentions: { parse: [] } });
-    const prompt = { id: message.id, title, text, channels, members, roles };
+    const prompt = { id: message.id, title, text, channels, members, roles, dm };
     savedPrompts.set(message.id, prompt);
     return prompt;
 }
@@ -1399,7 +1417,8 @@ async function deletePrompt(id) {
     savedPrompts.delete(id);
 }
 
-function buildPromptModal(existing) {
+function buildPromptModal(existing, dm = false) {
+    dm = existing ? Boolean(existing.dm) : dm;
     const titleInput = new TextInputBuilder()
         .setCustomId('title')
         .setLabel('Title (member, server or topic)') // Discord allows at most 45 characters here
@@ -1408,18 +1427,18 @@ function buildPromptModal(existing) {
         .setMaxLength(MAX_PROMPT_TITLE);
     const textInput = new TextInputBuilder()
         .setCustomId('text')
-        .setLabel('What should Duro know?')
+        .setLabel(dm ? 'How should Duro talk or behave in DMs?' : 'What should Duro know?')
         .setStyle(TextInputStyle.Paragraph)
         .setRequired(true)
         .setMaxLength(MAX_PROMPT_TEXT)
-        .setPlaceholder('Example: Rakib is a classmate who plays on our Minecraft server and loves redstone.');
+        .setPlaceholder(dm ? 'Example: Talk to this person in Banglish, be friendly and joke a little, call him bro.' : 'Example: Rakib is a classmate who plays on our Minecraft server and loves redstone.');
     if (existing) {
         titleInput.setValue(existing.title.slice(0, MAX_PROMPT_TITLE));
         textInput.setValue(existing.text.slice(0, MAX_PROMPT_TEXT));
     }
     return new ModalBuilder()
-        .setCustomId(existing ? `prompt-edit:${existing.id}` : 'prompt-add')
-        .setTitle(existing ? 'Edit prompt' : 'New prompt for Duro')
+        .setCustomId(existing ? `prompt-edit:${existing.id}` : (dm ? 'prompt-add-dm' : 'prompt-add'))
+        .setTitle(existing ? (dm ? 'Edit DM prompt' : 'Edit prompt') : (dm ? 'New DM prompt for Duro' : 'New prompt for Duro'))
         .addComponents(
             new ActionRowBuilder().addComponents(titleInput),
             new ActionRowBuilder().addComponents(textInput)
@@ -1438,13 +1457,13 @@ function promptListReply(page = 0) {
     const shown = prompts.slice(start, start + PROMPTS_PAGE_SIZE);
 
     const lines = shown
-        .map((p, i) => `**${start + i + 1}. ${p.title}**${p.channels?.length ? ` 🔗${p.channels.length}${p.channels.some(c => c.live) ? '👁️' : ''}` : ''}${p.members?.length ? ` 👤${p.members.length}` : ''}${p.roles?.length ? ` 🏷${p.roles.length}` : ''}: ${p.text.replace(/\s+/g, ' ').slice(0, 110)}${p.text.length > 110 ? '…' : ''}`)
+        .map((p, i) => `**${start + i + 1}. ${p.dm ? '💬 ' : ''}${p.title}**${p.channels?.length ? ` 🔗${p.channels.length}${p.channels.some(c => c.live) ? '👁️' : ''}` : ''}${p.members?.length ? ` 👤${p.members.length}` : ''}${p.roles?.length ? ` 🏷${p.roles.length}` : ''}: ${p.text.replace(/\s+/g, ' ').slice(0, 110)}${p.text.length > 110 ? '…' : ''}`)
         .join('\n')
         .slice(0, 1800);
     const menu = new StringSelectMenuBuilder()
         .setCustomId('plist-select')
         .setPlaceholder('Pick a prompt to edit, link channels or delete')
-        .addOptions(shown.map((p, i) => ({ label: `${start + i + 1}. ${p.title}`.slice(0, 100), value: p.id })));
+        .addOptions(shown.map((p, i) => ({ label: `${start + i + 1}. ${p.dm ? '💬 ' : ''}${p.title}`.slice(0, 100), value: p.id })));
 
     const components = [new ActionRowBuilder().addComponents(menu)];
     if (pages > 1) {
@@ -1477,8 +1496,9 @@ function promptDetailReply(prompt, notice = '') {
     const memberLines = (prompt.members ?? []).map(id => `<@${id}>`).join(' ');
     const roleLines = (prompt.roles ?? []).map(id => `<@&${id}>`).join(' ');
     const tail = (channelLines ? `\n\n🔗 **Linked channels**\n${channelLines}` : '') + (memberLines ? `\n\n👤 **Linked members**\n${memberLines}` : '') + (roleLines ? `\n\n🏷 **Linked roles**\n${roleLines}` : '');
-    const headRoom = Math.max(200, 1950 - tail.length - notice.length);
-    const content = `${notice}${`**${prompt.title}**\n${prompt.text}`.slice(0, headRoom)}${tail}`;
+    const headRoom = Math.max(200, 1850 - tail.length - notice.length);
+    const dmNote = prompt.dm ? '💬 *DM prompt: used only in private messages, for the linked members (every member if none is linked).*\n' : '';
+    const content = `${notice}${dmNote}${`**${prompt.title}**\n${prompt.text}`.slice(0, headRoom)}${tail}`;
 
     const components = [new ActionRowBuilder().addComponents(
         new ChannelSelectMenuBuilder()
@@ -1536,8 +1556,9 @@ async function handlePromptModal(interaction) {
             return;
         }
         const title = interaction.fields.getTextInputValue('title').replace(/\s+/g, ' ').trim();
-        const text = interaction.fields.getTextInputValue('text').replace(/^\s*[⛓👤🏷]/gm, '').trim(); // ⛓ at a line start is reserved for the channel links
+        const text = interaction.fields.getTextInputValue('text').replace(/^\s*[⛓👤🏷💬]/gm, '').trim(); // ⛓ at a line start is reserved for the channel links
         const editId = interaction.customId.split(':')[1];
+        const isDmPrompt = editId ? Boolean(savedPrompts.get(editId)?.dm) : interaction.customId === 'prompt-add-dm';
 
         if (!title || !text) {
             await interaction.reply({ content: '⚠️ Both the title and the text are needed.', flags: MessageFlags.Ephemeral });
@@ -1554,10 +1575,10 @@ async function handlePromptModal(interaction) {
         }
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        await savePrompt(title, text, editId, editId ? (savedPrompts.get(editId)?.channels ?? []) : [], editId ? (savedPrompts.get(editId)?.members ?? []) : [], editId ? (savedPrompts.get(editId)?.roles ?? []) : []);
+        await savePrompt(title, text, editId, editId ? (savedPrompts.get(editId)?.channels ?? []) : [], editId ? (savedPrompts.get(editId)?.members ?? []) : [], editId ? (savedPrompts.get(editId)?.roles ?? []) : [], isDmPrompt);
         await interaction.editReply({
             content: `✅ ${editId ? 'Updated' : 'Saved'}: **${title}**. Duro will use it from now on, even after restarts.` +
-                (editId ? '' : '\nTo link channels to it, open `/duro-prompts-list` and pick it.'),
+                (editId ? '' : (isDmPrompt ? '\n💬 This is a DM prompt. To choose which member it is for, open `/duro-prompts-list`, pick it and use the member menu (no member chosen = it applies to every member in DMs).' : '\nTo link channels to it, open `/duro-prompts-list` and pick it.')),
             allowedMentions: { parse: [] }
         });
     } catch (error) {
@@ -1608,7 +1629,7 @@ async function handlePromptList(interaction) {
                 for (const user of interaction.users?.values() ?? []) memberNames.set(user.id, interaction.members?.get(user.id)?.displayName ?? user.username);
             }
             await interaction.deferUpdate();
-            const saved = await savePrompt(prompt.title, prompt.text, id, channels, members, roles);
+            const saved = await savePrompt(prompt.title, prompt.text, id, channels, members, roles, Boolean(prompt.dm));
             await interaction.editReply(promptDetailReply(saved));
         } else if (action === 'plist-edit') {
             await interaction.showModal(buildPromptModal(prompt));
@@ -1678,6 +1699,11 @@ client.once(Events.ClientReady, async () => {
         new SlashCommandBuilder()
             .setName('duro-prompt')
             .setDescription('Admins only: save a note for Duro (about a member, the Minecraft server, anything).')
+            .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+            .setDMPermission(false),
+        new SlashCommandBuilder()
+            .setName('duro-dm-prompt')
+            .setDescription('Admins only: write how Duro should talk or behave in DMs (choose the member in /duro-prompts-list).')
             .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
             .setDMPermission(false),
         new SlashCommandBuilder()
@@ -1789,6 +1815,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
             'duro-models': PermissionFlagsBits.Administrator,
             'duro-models-channel': PermissionFlagsBits.Administrator,
             'duro-prompt': PermissionFlagsBits.Administrator,
+            'duro-dm-prompt': PermissionFlagsBits.Administrator,
             'duro-prompts-list': PermissionFlagsBits.Administrator,
             'purge': PermissionFlagsBits.Administrator
         }[interaction.commandName];
@@ -1909,6 +1936,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
                     break;
                 }
                 await interaction.showModal(buildPromptModal());
+                break;
+            }
+
+            case 'duro-dm-prompt': {
+                if (savedPrompts.size >= MAX_PROMPTS) {
+                    await interaction.reply({ content: `⚠️ You already have ${MAX_PROMPTS} prompts. Delete one with \`/duro-prompts-list\` first.`, flags: MessageFlags.Ephemeral });
+                    break;
+                }
+                await interaction.showModal(buildPromptModal(null, true));
                 break;
             }
 
@@ -2584,8 +2620,95 @@ async function maybeReactToDuroMention(message) {
 // ---------------------------------------------------------------------------
 // Chat messages
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Private messages (DM)
+// ---------------------------------------------------------------------------
+// Members of the server can talk to Duro in a DM. Anyone else gets a short refusal.
+async function handleDirectMessage(message) {
+    const guild = client.guilds.cache.first();
+    const member = guild ? await guild.members.fetch(message.author.id).catch(() => null) : null;
+    if (!member) {
+        await message.reply({ content: `I only chat with members of ${guild?.name ?? 'the ChaosBoys server'}.`, allowedMentions: { parse: [] } }).catch(() => {});
+        return;
+    }
+    const hasImages = hasReadableAttachment(message.attachments);
+    const spokenText = message.content.trim();
+    if (!spokenText && !hasImages) return;
+    if (usersBeingAnswered.has(message.author.id)) return; // still answering this person
+
+    usersBeingAnswered.add(message.author.id);
+    message.channel.sendTyping().catch(() => {});
+    const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
+    try {
+        const imageParts = await buildAttachmentParts(message.attachments);
+        if (!spokenText && imageParts.length) imageParts.unshift({ text: '[The person sent only the attached file(s) with no text. Look at what is attached and say briefly what it is and what stands out.]' });
+        const answer = await generateAnswer({
+            channelId: `dm-${message.author.id}`,
+            userId: message.author.id,
+            author: member.displayName || message.author.username,
+            userText: spokenText || '(file only)',
+            imageParts,
+            senderRole: getSenderRole(message.author, member.permissions, guild),
+            guild
+        });
+        const chunks = splitMessage(answer);
+        await message.reply({ content: chunks[0], allowedMentions: { parse: [] } });
+        for (const chunk of chunks.slice(1)) await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
+    } catch (error) {
+        console.error('DM handling error:', error);
+        await message.reply({ content: friendlyErrorMessage(error), allowedMentions: { parse: [] } }).catch(() => {});
+    } finally {
+        clearInterval(typingInterval);
+        usersBeingAnswered.delete(message.author.id);
+    }
+}
+
+// Owner or admin: "@Duro dm @Siam: hello" / "@Duro send a dm to @Siam and @Rafi: hello" makes Duro send a private message first
+const DM_COMMAND_RE = /^(?:(?:please|pls|plz)\s+)?(?:(?:dm|pm)|(?:send|write|give|text)\s+(?:a\s+|an\s+)?(?:dm|pm|direct message|private message|message privately)(?:\s+to)?|(?:message|tell)\s+privately)\s+((?:<@!?\d+>(?:\s*(?:,|and|&)?\s*)?)+)\s*:?\s*(.*)$/is;
+function parseAdminDm(spokenText) {
+    const match = spokenText.trim().match(DM_COMMAND_RE);
+    if (!match) return null;
+    const ids = [...new Set([...match[1].matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].slice(0, 5);
+    let text = match[2].trim();
+    const quoted = text.match(/^["“](.+)["”]$/s);
+    if (quoted) text = quoted[1].trim();
+    return { ids, text };
+}
+
+async function runAdminDm(message, command, role) {
+    const noPing = { parse: [], repliedUser: false };
+    const answerAdmin = content => message.reply({ content, allowedMentions: noPing }).catch(() => {});
+    if (!command.text) {
+        await answerAdmin('What should I send? For example: `@Duro dm @Siam: hello`');
+        return;
+    }
+    const text = linkChannelNames(linkSeenMembers(command.text), message.guild);
+    const done = [], failed = [];
+    for (const id of command.ids) {
+        if (id === client.user.id) continue;
+        const member = await message.guild.members.fetch(id).catch(() => null);
+        if (!member || member.user.bot) { failed.push(`<@${id}> (not a member of this server)`); continue; }
+        try {
+            for (const chunk of splitMessage(text)) await member.user.send({ content: chunk, allowedMentions: { parse: [] } });
+            addToHistory(`dm-${id}`, 'model', text);   // so Duro knows what it said when they reply
+            done.push(`<@${id}>`);
+        } catch (error) {
+            failed.push(`<@${id}> (their private messages are closed)`);
+        }
+    }
+    const author = message.member?.displayName || message.author.username;
+    console.log(`${author} (${role}) made Duro DM ${done.length} member(s): ${text.slice(0, 80)}`);
+    if (done.length) await sendModLog(`📩 ${author} (${role}) made Duro send a private message to ${done.join(', ')}:\n> ${text.slice(0, 300).replace(/\n/g, '\n> ')}`);
+    if (done.length && !failed.length) await message.react('✅').catch(() => {});
+    else await answerAdmin(`${done.length ? `✅ Sent to ${done.join(', ')}. ` : ''}${failed.length ? `⚠️ Could not send to: ${failed.join(', ')}.` : ''}`);
+}
+
 client.on(Events.MessageCreate, async (message) => {
-    if (message.author.bot || !message.inGuild()) return;
+    if (message.author.bot) return;
+    if (!message.inGuild()) {
+        handleDirectMessage(message).catch(error => console.error('DM error:', error.message));
+        return;
+    }
     rememberMember(message);
     reportEveryoneMention(message).catch(() => {});
 
@@ -2631,6 +2754,11 @@ client.on(Events.MessageCreate, async (message) => {
     if (mentioned && !hasImages) {
         const senderRole = getSenderRole(message.author, message.member?.permissions, message.guild);
         if (senderRole === 'owner' || senderRole === 'admin') {
+            const dmCommand = parseAdminDm(spokenText);
+            if (dmCommand) {
+                await runAdminDm(message, dmCommand, senderRole);
+                return;
+            }
             const sayCommand = parseAdminSay(spokenText);
             if (sayCommand) {
                 await runAdminSay(message, sayCommand, senderRole);
