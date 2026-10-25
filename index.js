@@ -810,6 +810,32 @@ async function getPresenceNote(userText, guild) {
     return `[Live Discord status, real data right now, tell it as it is: ${lines.join(' | ')}. Members who appear invisible on Discord show as offline. For the member or role the person asked about, write its exact code so it is clickable. For the names of role members, say the total and name at most 7 of them in plain text (like \"13 online: Arefin, Rakib, ... and 6 more\"), phrased naturally and differently each time.]`;
 }
 
+// ---- Comparing numbers like "1.9 or 1.11": small models often get it wrong, so the code works out the answer and hands it over ----
+const COMPARE_WORDS = /\b(bigger|larger|greater|smaller|less|lower|higher|more|newer|older|latest|biggest|largest|smallest|which|compare)\b/i;
+const VERSION_CONTEXT = /\b(minecraft|mc|version|versions|update|patch|java|bedrock|release|snapshot|software|app|android|ios|python|node)\b/i;
+const MATH_CONTEXT = /\b(number|numbers|decimal|decimals|math|maths|mathematically|value|digit)\b/i;
+
+function getNumberCompareNote(userText) {
+    const found = [...userText.matchAll(/(?<![\w.])(\d+(?:\.\d+)+)(?![\w.]*\d)/g)].map(m => m[1]);
+    if (found.length !== 2 || found[0] === found[1] || !COMPARE_WORDS.test(userText)) return null;
+    const [a, b] = found;
+    const asVersion = (x, y) => {
+        const p = x.split('.').map(Number), q = y.split('.').map(Number);
+        for (let i = 0; i < Math.max(p.length, q.length); i++) {
+            const d = (p[i] ?? 0) - (q[i] ?? 0);
+            if (d) return d;
+        }
+        return 0;
+    };
+    const decimalBigger = Number(a) === Number(b) ? null : (Number(a) > Number(b) ? a : b);
+    const versionNewer = asVersion(a, b) === 0 ? null : (asVersion(a, b) > 0 ? a : b);
+    const useVersion = VERSION_CONTEXT.test(userText), useMath = MATH_CONTEXT.test(userText);
+    const rule = useVersion && !useMath ? `The question is about version numbers, so answer: ${versionNewer} is the newer/bigger one.`
+        : useMath && !useVersion ? `The question is about plain numbers, so answer: ${decimalBigger} is the bigger one.`
+        : `It is unclear if these are plain numbers or version numbers: say both in one short sentence.`;
+    return `[Checked by code, trust it and do not recalculate: as plain decimal numbers ${decimalBigger} is bigger (compare them as decimals, like 1.9 = 1.90); as version numbers ${versionNewer} is newer (parts are compared one by one). ${rule}]`;
+}
+
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null }) {
     if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return REFUSAL_TEXT;
 
@@ -824,6 +850,8 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     const userParts = [{ text: promptText }];
     if (webResults) userParts.push({ text: webResults });
     if (presenceNote) userParts.push({ text: presenceNote });
+    const compareNote = getNumberCompareNote(userText);
+    if (compareNote) userParts.push({ text: compareNote });
     userParts.push(...imageParts);
 
     const contents = [...history, { role: 'user', parts: userParts }];
