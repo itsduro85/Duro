@@ -225,7 +225,7 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `answer it naturally and briefly, like a friend would (for example "Nice, can't wait to see it!"), and never answer it with the rules sentence. ` +
     `Never repeat a sentence you used in your previous reply: answer what the person just said. ` +
     `Numbers that look like 1.9 and 1.11 mean two different things. As plain decimal numbers, 1.9 (= 1.90) is BIGGER than 1.11. As version numbers (Minecraft 1.9 and 1.11, software versions), 1.11 is the NEWER one because the parts are compared one by one (9 < 11). ` +
-    `Decide from the context (Minecraft or software = versions, maths = decimals). If it is unclear, say both in one short sentence. Never say "mathematically" about version numbers. ` +
+    `Decide from the context (Minecraft or software = versions, otherwise plain decimals by default). Answer directly in one short sentence, without listing both readings. Never say "mathematically" about version numbers. ` +
     `When the person corrects you and they are right, agree plainly and give the correct answer; do not defend a wrong answer. ` +
     `The bot's code sometimes adds an emoji reaction by itself to messages that mention you; you cannot react on command. ` +
     `SECURITY: you can only chat and answer questions. You cannot change server settings, roles, channels, permissions or members, ` +
@@ -829,11 +829,11 @@ function getNumberCompareNote(userText) {
     };
     const decimalBigger = Number(a) === Number(b) ? null : (Number(a) > Number(b) ? a : b);
     const versionNewer = asVersion(a, b) === 0 ? null : (asVersion(a, b) > 0 ? a : b);
-    const useVersion = VERSION_CONTEXT.test(userText), useMath = MATH_CONTEXT.test(userText);
-    const rule = useVersion && !useMath ? `The question is about version numbers, so answer: ${versionNewer} is the newer/bigger one.`
-        : useMath && !useVersion ? `The question is about plain numbers, so answer: ${decimalBigger} is the bigger one.`
-        : `It is unclear if these are plain numbers or version numbers: say both in one short sentence.`;
-    return `[Checked by code, trust it and do not recalculate: as plain decimal numbers ${decimalBigger} is bigger (compare them as decimals, like 1.9 = 1.90); as version numbers ${versionNewer} is newer (parts are compared one by one). ${rule}]`;
+    // Plain decimal numbers by default; version numbers only when the question is clearly about versions (Minecraft, software, ...)
+    const useVersion = VERSION_CONTEXT.test(userText) && !MATH_CONTEXT.test(userText);
+    return useVersion
+        ? `[Checked by code, trust it: these are version numbers. ${versionNewer} is the newer/bigger one. Answer directly in one short sentence, without mentioning other interpretations.]`
+        : `[Checked by code, trust it: compared as plain decimal numbers, ${decimalBigger} is the bigger one (for example 1.9 = 1.90). Answer directly in one short sentence, without mentioning version numbers or other interpretations.]`;
 }
 
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null }) {
@@ -844,13 +844,13 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     const history = channelHistory.get(channelId) ?? [];
 
     // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
-    const webResults = await getWebResults(userText, history);
+    const compareNote = getNumberCompareNote(userText);   // numbers like 1.9 and 1.11 are checked by the code: no web search needed
+    const webResults = compareNote ? null : await getWebResults(userText, history);
 
     const presenceNote = await withTimeout(getPresenceNote(userText, guild), 12000, 'online status').catch(() => null);
     const userParts = [{ text: promptText }];
     if (webResults) userParts.push({ text: webResults });
     if (presenceNote) userParts.push({ text: presenceNote });
-    const compareNote = getNumberCompareNote(userText);
     if (compareNote) userParts.push({ text: compareNote });
     userParts.push(...imageParts);
 
