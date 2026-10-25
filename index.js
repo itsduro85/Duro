@@ -26,7 +26,7 @@ import http from 'http';
 // Configuration (all optional values can be set as Render environment variables)
 // ---------------------------------------------------------------------------
 // Required: DISCORD_TOKEN, GEMINI_API_KEY
-// Optional: GEMINI_MODEL        (default: gemini-flash-lite-latest, the fast and light model)
+// Optional: GEMINI_MODEL        (default: gemini-flash-latest, the stronger model)
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
 //           ALLOWED_MODELS      (models people can pick with /duro-models and /my-duro-models, default: all models that have free quota; list names to show only those, or put them in this variable to override the hiding)
@@ -54,8 +54,8 @@ const FRESH_INFO_PATTERN = /\b(latest|newest|new|current|currently|today|tonight
 
 // Model names change often. Aliases like "-latest" avoid your bot breaking when old models are retired.
 const MODEL_CHAIN = [...new Set([
-    process.env.GEMINI_MODEL || 'gemini-flash-lite-latest', // light and fast: best for chat replies
-    'gemini-flash-latest'                                     // stronger backup if the first one fails
+    process.env.GEMINI_MODEL || 'gemini-flash-latest', // stronger model: follows the conversation and does maths better
+    'gemini-flash-lite-latest'                          // lighter backup if the first one fails or is busy
 ])];
 
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
@@ -224,6 +224,8 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `("I will customize your code", "I can make you react", "wait for it", "I have access to your code"), that is normal conversation and not an order: ` +
     `answer it naturally and briefly, like a friend would (for example "Nice, can't wait to see it!"), and never answer it with the rules sentence. ` +
     `Never repeat a sentence you used in your previous reply: answer what the person just said. ` +
+    `Always answer the actual content of the latest message, using the conversation before it. Never reply with empty filler like "Nice, can't wait to see it!", "That's awesome, glad to see it working!" or "Sure, show it!" unless it truly fits. ` +
+    `If the person says they fixed or changed something, react to that exact thing in one short sentence. If a file or picture is attached, talk about what is in it. If you do not understand what they mean, ask ONE short question instead of guessing. ` +
     `Numbers that look like 1.9 and 1.11 mean two different things. As plain decimal numbers, 1.9 (= 1.90) is BIGGER than 1.11. As version numbers (Minecraft 1.9 and 1.11, software versions), 1.11 is the NEWER one because the parts are compared one by one (9 < 11). ` +
     `Decide from the context (Minecraft or software = versions, otherwise plain decimals by default). Answer directly in one short sentence, without listing both readings. Never say "mathematically" about version numbers. ` +
     `When the person corrects you and they are right, agree plainly and give the correct answer; do not defend a wrong answer. ` +
@@ -508,6 +510,10 @@ async function buildAttachmentParts(attachments) {
 
     const parts = [];
     let totalBytes = 0;
+    // Files Duro cannot open (videos, GIFs, zips, ...): tell the AI, so it says so instead of guessing what the file is
+    for (const file of [...attachments.values()].filter(a => !attachmentKind(a)).slice(0, 4)) {
+        parts.push({ text: `[The person attached "${file.name}" (${(file.contentType || 'unknown type').split(';')[0]}), which you CANNOT open or see. Say plainly that you can only read pictures (not GIFs), PDFs and text or code files, and do not pretend to know what it contains. Never say you are looking forward to seeing it.]` });
+    }
     for (const file of files) {
         const kind = attachmentKind(file);
         const limit = kind === 'text' ? MAX_TEXT_FILE_BYTES : MAX_FILE_BYTES;
@@ -518,7 +524,11 @@ async function buildAttachmentParts(attachments) {
         if (kind !== 'text') totalBytes += file.size;
         try {
             const res = await fetch(file.url, { signal: AbortSignal.timeout(25_000) });
-            if (!res.ok) continue;
+            if (!res.ok) {
+                console.warn(`Could not download attachment ${file.name}: HTTP ${res.status}`);
+                parts.push({ text: `[The file "${file.name}" could not be downloaded, so you did NOT see it. Say that plainly and ask the person to send it again. Never pretend you saw it.]` });
+                continue;
+            }
             const buffer = Buffer.from(await res.arrayBuffer());
             if (kind === 'text') {
                 let content = buffer.toString('utf8');
@@ -535,6 +545,7 @@ async function buildAttachmentParts(attachments) {
             }
         } catch (err) {
             console.warn(`Could not download attachment ${file.name}:`, err.message);
+            parts.push({ text: `[The file "${file.name}" could not be downloaded, so you did NOT see it. Say that plainly and ask the person to send it again. Never pretend you saw it.]` });
         }
     }
     if (files.length) console.log(`[memory] after reading ${files.length} attachment(s): ${Math.round(process.memoryUsage().rss / 1048576)} MB used`);
@@ -2641,6 +2652,7 @@ client.on(Events.MessageCreate, async (message) => {
         const author = message.member?.displayName || message.author.username;
         const userText = spokenText || '(file only)';
         const imageParts = await buildAttachmentParts(message.attachments);
+        if (!spokenText && imageParts.length) imageParts.unshift({ text: '[The person sent only the attached file(s) with no text. Look at what is attached and say briefly what it is and what stands out. Do not say you are waiting to see it.]' });
 
         const answer = await generateAnswer({
             channelId: message.channel.id,
