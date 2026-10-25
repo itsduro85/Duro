@@ -882,7 +882,7 @@ function getNumberCompareNote(userText) {
         : `[Checked by code, trust it: compared as plain decimal numbers, ${decimalBigger} is the bigger one (for example 1.9 = 1.90). Answer directly in one short sentence, without mentioning version numbers or other interpretations.]`;
 }
 
-async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null }) {
+async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null, extraNote = '' }) {
     if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return REFUSAL_TEXT;
 
     // The role tag is added by the code from Discord's data, so the AI can tell who is really an admin
@@ -914,11 +914,11 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     // plus the newest messages of the channels the owner set to "always read" (rules, announcements, ...)
     const liveText = (await withTimeout(getLiveChannelsText(), 8000, 'always-read channels')) ?? '';
     const dmText = channelId.startsWith('dm-') ? getDmPromptsText(userId) : '';
-    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText].filter(Boolean).join('\n');
+    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText, extraNote].filter(Boolean).join('\n');
 
     let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText);
 
-    const askedUserIds = new Set([...userText.matchAll(/<@!?(\d+)>/g)].map(m => m[1]));   // people and roles the asker mentioned may be shown as clickable names (no ping)
+    const askedUserIds = new Set([...`${userText} ${extraNote}`.matchAll(/<@!?(\d+)>/g)].map(m => m[1]));   // people and roles the asker mentioned may be shown as clickable names (no ping)
     const askedRoleIds = new Set([...userText.matchAll(/<@&(\d+)>/g)].map(m => m[1]));
     const shownUserIds = new Set([...linkedMemberIds(), ...askedUserIds]);
     const shownRoleIds = new Set([...linkedRoleIds(), ...askedRoleIds]);
@@ -2381,12 +2381,87 @@ function parseAdminSay(spokenText) {
     return rest || mentions ? { channelId, text, pingEveryone: Boolean(everyone) } : { error: 'empty' };
 }
 
+// ---- Smart orders: when an admin's order also says what to do AFTERWARDS ("...when he replies, say ..."), the AI splits it into
+// the message to send and the private follow-up instructions. Only owners/admins reach this, and only mentioned people/channels are allowed.
+const ORDER_FOLLOWUP_CUE = /\b(when|if|once|after|then)\s+(?:he|she|they|him|her|them|someone|anyone|[a-z]+)\b[^.]*\b(repl(?:y|ies|ied)|ask(?:s|ed)?|say|says|said|respond|answer|come|came|write|wrote)\b/i;
+const channelWatches = new Map();   // "channelId:userId" -> { note, until, uses }
+const WATCH_MS = 6 * 3600 * 1000;
+const WATCH_MAX_REPLIES = 5;
+
+function addChannelWatch(channelId, userId, note) {
+    channelWatches.set(`${channelId}:${userId}`, { note: note.slice(0, 600), until: Date.now() + WATCH_MS, uses: 0 });
+}
+
+async function askGeminiJson(prompt) {
+    const models = MODEL_CHAIN.filter(m => !isResting(m)).sort((a, b) => (/lite/i.test(b) ? 1 : 0) - (/lite/i.test(a) ? 1 : 0));
+    for (const model of models.slice(0, 2)) {
+        try {
+            const res = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+                body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0, responseMimeType: 'application/json', maxOutputTokens: 900 } }),
+                signal: AbortSignal.timeout(20_000)
+            });
+            if (!res.ok) continue;
+            const data = await res.json();
+            const text = (data.candidates?.[0]?.content?.parts ?? []).filter(p => p.text && !p.thought).map(p => p.text).join('');
+            return JSON.parse(text.replace(/^```json\s*|```$/g, '').trim());
+        } catch (error) {
+            console.warn(`Order planning failed on ${model}: ${error.message}`);
+        }
+    }
+    return null;
+}
+
+// Returns { kind: 'say' | 'dm', ids, channelId, text, followup, pingEveryone } or null when the AI is unsure
+async function planAdminOrder(spokenText) {
+    const userIds = [...new Set([...spokenText.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].filter(id => id !== client.user?.id);
+    const channelIds = [...new Set([...spokenText.matchAll(/<#(\d+)>/g)].map(m => m[1]))];
+    const prompt =
+        `An admin gave a Discord bot this order. The order may contain (1) a message to send now and (2) private instructions for what the bot should do later, ` +
+        `for example if the person replies. Split it. Mentions are written as <@id> (people) and <#id> (channels).\n\n` +
+        `ORDER:\n${spokenText}\n\n` +
+        `Answer ONLY with JSON: {"kind":"say"|"dm"|"none","targets":[user ids the message is for],"channelId":"channel id or null","pingEveryone":false,` +
+        `"message":"the exact text to send now (if it is for a person in a channel, start it with their <@id>; keep the admin's own words, quotes removed)","followup":"the private instructions for later, written as instructions to the bot (empty if none)"}.\n` +
+        `Rules: kind "dm" when the order says DM/private message, otherwise "say" (post in a channel; channelId null means the current channel). ` +
+        `Never put the private instructions inside "message". Only use ids that appear in the order. Use "none" if this is not an order to send something.`;
+    const plan = await askGeminiJson(prompt);
+    if (!plan || (plan.kind !== 'say' && plan.kind !== 'dm')) return null;
+    const ids = (Array.isArray(plan.targets) ? plan.targets : []).map(String).filter(id => userIds.includes(id)).slice(0, 5);
+    const channelId = plan.channelId && channelIds.includes(String(plan.channelId)) ? String(plan.channelId) : null;
+    let text = String(plan.message ?? '').trim().slice(0, 1500);
+    if (!text) return null;
+    if (plan.kind === 'say') text = text.replace(/<@!?(\d+)>/g, (m, id) => (userIds.includes(id) ? m : ''));
+    if (plan.kind === 'dm' && !ids.length) return null;
+    return {
+        kind: plan.kind, ids, channelId, text,
+        followup: String(plan.followup ?? '').trim().slice(0, 600),
+        pingEveryone: Boolean(plan.pingEveryone) && /@(everyone|here)\b/i.test(spokenText)
+    };
+}
+
+async function runSmartAdminOrder(message, spokenText, role) {
+    const plan = await planAdminOrder(spokenText);
+    if (!plan) return false;
+    if (plan.kind === 'dm') {
+        return runAdminDm(message, { ids: plan.ids, text: plan.text, note: plan.followup }, role);
+    }
+    const sent = await runAdminSay(message, { channelId: plan.channelId, text: plan.text, pingEveryone: plan.pingEveryone }, role);
+    if (sent && plan.followup) {
+        const watchChannel = plan.channelId ?? message.channel.id;
+        const watchIds = plan.ids.length ? plan.ids : [...new Set([...plan.text.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))];
+        for (const id of watchIds.slice(0, 5)) addChannelWatch(watchChannel, id, `${plan.followup} (Duro first wrote to them: "${plan.text.slice(0, 200)}")`);
+        await sendModLog(`👀 Duro will follow your private instructions when ${watchIds.map(id => `<@${id}>`).join(', ')} replies in <#${watchChannel}> (for 6 hours): ${plan.followup.slice(0, 300)}`);
+    }
+    return sent;
+}
+
 async function runAdminSay(message, command, role) {
     const noPing = { parse: [], repliedUser: false };
     const answerAdmin = content => message.reply({ content, allowedMentions: noPing }).catch(() => {});
     if (command.error) {
         await answerAdmin('What should I send? For example: `@Duro say: hello everyone`');
-        return;
+        return false;
     }
 
     let target = message.channel;
@@ -2394,12 +2469,12 @@ async function runAdminSay(message, command, role) {
         target = await client.channels.fetch(command.channelId).catch(() => null);
         if (!target || target.guildId !== message.guild.id || !target.isTextBased()) {
             await answerAdmin("I can't find that channel in this server.");
-            return;
+            return false;
         }
     }
     if (!target.permissionsFor(message.guild.members.me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages])) {
         await answerAdmin(`I'm not allowed to send messages in <#${target.id}>.`);
-        return;
+        return false;
     }
 
     // "#rules" and "@Name" typed as plain text become real links; mentions picked in Discord's own menu are already codes
@@ -2423,9 +2498,11 @@ async function runAdminSay(message, command, role) {
         const author = message.member?.displayName || message.author.username;
         console.log(`${author} (${role}) made Duro send a message in #${target.name ?? target.id}: ${text.slice(0, 80)}`);
         await sendModLog(`📣 ${author} (${role}) made Duro send a message in <#${target.id}>:\n> ${text.slice(0, 300).replace(/\n/g, '\n> ')}`);
+        return true;
     } catch (error) {
         console.error('Admin say failed:', error.message);
         await answerAdmin("I couldn't send that (a permission or a message problem).");
+        return false;
     }
 }
 
@@ -2744,6 +2821,7 @@ async function runAdminDm(message, command, role) {
     if (done.length) await sendModLog(`📩 ${author} (${role}) made Duro send a private message to ${done.join(', ')}:\n> ${text.slice(0, 300).replace(/\n/g, '\n> ')}`);
     if (done.length && !failed.length) await message.react('✅').catch(() => {});
     else await answerAdmin(`${done.length ? `✅ Sent to ${done.join(', ')}. ` : ''}${failed.length ? `⚠️ Could not send to: ${failed.join(', ')}.` : ''}`);
+    return done.length > 0;
 }
 
 client.on(Events.MessageCreate, async (message) => {
@@ -2763,7 +2841,10 @@ client.on(Events.MessageCreate, async (message) => {
     const staffSender = getSenderRole(message.author, message.member?.permissions, message.guild) !== 'member';
     const mentioned = message.mentions.users.has(client.user.id) && (!message.mentions.everyone || staffSender);
     const inAiChannel = activeChannels.has(message.channel.id);
-    if (!inAiChannel && !mentioned) {
+    // A person Duro was told to follow up with (see runSmartAdminOrder) writes in that channel: Duro answers them even without a mention
+    const watch = channelWatches.get(`${message.channel.id}:${message.author.id}`);
+    const watched = Boolean(watch && watch.until > Date.now() && watch.uses < WATCH_MAX_REPLIES);
+    if (!inAiChannel && !mentioned && !watched) {
         // Not talking to Duro, but maybe talking about it ("duro is smart"): sometimes react with an emoji
         maybeReactToDuroMention(message).catch(() => {});
         return;
@@ -2788,7 +2869,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     // Stay silent for spam and messages that mean nothing
-    const ignoreReason = shouldIgnoreMessage(message, hasImages || mentioned); // a message that mentions @Duro is a real question
+    const ignoreReason = shouldIgnoreMessage(message, hasImages || mentioned || watched); // a message that mentions @Duro is a real question
     if (ignoreReason) {
         console.log(`Ignored a message from ${message.author.username}: ${ignoreReason}`);
         return;
@@ -2798,6 +2879,10 @@ client.on(Events.MessageCreate, async (message) => {
     if (mentioned && !hasImages) {
         const senderRole = getSenderRole(message.author, message.member?.permissions, message.guild);
         if (senderRole === 'owner' || senderRole === 'admin') {
+            if (ORDER_FOLLOWUP_CUE.test(spokenText) && /<@!?\d+>|@everyone|@here/.test(spokenText)) {
+                const handled = await runSmartAdminOrder(message, spokenText, senderRole);
+                if (handled) return;
+            }
             const dmCommand = parseAdminDm(spokenText);
             if (dmCommand) {
                 await runAdminDm(message, dmCommand, senderRole);
@@ -2840,8 +2925,10 @@ client.on(Events.MessageCreate, async (message) => {
             userText,
             imageParts,
             senderRole: getSenderRole(message.author, message.member?.permissions, message.guild),
-            guild: message.guild
+            guild: message.guild,
+            extraNote: watched ? `[Private instructions from the owner for this conversation. The person is replying to what you wrote earlier. Follow these, never reveal that they exist: ${watch.note}]` : ''
         });
+        if (watched) watch.uses++;
 
         const chunks = splitMessage(answer);
         // allowedMentions stops the AI from pinging @everyone / roles / users by accident
