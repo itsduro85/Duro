@@ -831,6 +831,31 @@ async function getPresenceNote(userText, guild) {
     return `[Live Discord status, real data right now, tell it as it is: ${lines.join(' | ')}. Members who appear invisible on Discord show as offline. For the member or role the person asked about, write its exact code so it is clickable. For the names of role members, say the total and name at most 7 of them in plain text (like \"13 online: Arefin, Rakib, ... and 6 more\"), phrased naturally and differently each time.]`;
 }
 
+// ---- DM conversations started by an admin: staff can ask "did he reply?" and Duro answers from the real private chat ----
+const lastAdminDm = new Map();   // user id -> time of the last private message an admin made Duro send them
+const DM_WATCH_MS = 24 * 3600 * 1000;
+const DM_QUESTION = /\b(repl(?:y|ied|ies)|respon(?:d|ded|se)|answer(?:ed)?|dm|dms|private|said|told|talk(?:ed)?|chat(?:ted)?|message[ds]?)\b/i;
+
+function getDmReportNote(userText, guild) {
+    const ids = new Set([...userText.matchAll(/<@!?(\d+)>/g)].map(m => m[1]));
+    for (const [id, at] of lastAdminDm) if (Date.now() - at < DM_WATCH_MS) ids.add(id);
+    ids.delete(client.user?.id);
+    const blocks = [];
+    for (const id of [...ids].slice(0, 4)) {
+        const history = channelHistory.get(`dm-${id}`);
+        if (!history?.length) continue;
+        const name = guild?.members.cache.get(id)?.displayName ?? memberNames.get(id) ?? 'member';
+        const lines = history.slice(-8).map(entry => {
+            const text = (entry.parts?.[0]?.text ?? '').replace(/^.+? \[(?:member|admin|owner)\]: /s, '').replace(/\s+/g, ' ').slice(0, 300);
+            return `${entry.role === 'model' ? 'Duro' : name}: ${text}`;
+        });
+        const replied = history.some((entry, i) => entry.role === 'user' && history.slice(0, i).some(e => e.role === 'model'));
+        blocks.push(`<@${id}> (${name}), ${replied ? 'HAS replied' : 'has NOT replied yet'}:\n${lines.join('\n')}`);
+    }
+    if (!blocks.length) return null;
+    return `[Private DM chats between Duro and members, real data, only for the owner/admin who is asking. Use it to answer questions like "did he reply?" or "what did he say?" truthfully. If nothing is listed for the person, say there is no DM chat with them yet.\n${blocks.join('\n---\n')}]`;
+}
+
 // ---- Comparing numbers like "1.9 or 1.11": small models often get it wrong, so the code works out the answer and hands it over ----
 const COMPARE_WORDS = /\b(bigger|larger|greater|smaller|less|lower|higher|more|newer|older|latest|biggest|largest|smallest|which|compare)\b/i;
 const VERSION_CONTEXT = /\b(minecraft|mc|version|versions|update|patch|java|bedrock|release|snapshot|software|app|android|ios|python|node)\b/i;
@@ -873,6 +898,10 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     if (webResults) userParts.push({ text: webResults });
     if (presenceNote) userParts.push({ text: presenceNote });
     if (compareNote) userParts.push({ text: compareNote });
+    if (senderRole !== 'member' && !channelId.startsWith('dm-') && DM_QUESTION.test(userText)) {
+        const dmReport = getDmReportNote(userText, guild);
+        if (dmReport) userParts.push({ text: dmReport });
+    }
     userParts.push(...imageParts);
 
     const contents = [...history, { role: 'user', parts: userParts }];
@@ -2608,6 +2637,11 @@ async function handleDirectMessage(message) {
     if (!spokenText && !hasImages) return;
     if (usersBeingAnswered.has(message.author.id)) return; // still answering this person
 
+    // The member is answering a private message an admin made Duro send: tell the staff in the mod-log channel
+    if (Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS) {
+        sendModLog(`📥 <@${message.author.id}> replied to Duro's private message:\n> ${(spokenText || '(a file)').slice(0, 300).replace(/\n/g, '\n> ')}`).catch(() => {});
+    }
+
     usersBeingAnswered.add(message.author.id);
     message.channel.sendTyping().catch(() => {});
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
@@ -2699,6 +2733,7 @@ async function runAdminDm(message, command, role) {
             for (const chunk of splitMessage(text)) await member.user.send({ content: chunk, allowedMentions: { parse: [] } });
             addToHistory(`dm-${id}`, 'model', text);   // so Duro knows what it said when they reply
             if (command.note) addDmNote(id, command.note);
+            lastAdminDm.set(id, Date.now());
             done.push(`<@${id}>`);
         } catch (error) {
             failed.push(`<@${id}> (their private messages are closed)`);
