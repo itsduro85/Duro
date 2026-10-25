@@ -2722,7 +2722,9 @@ client.on(Events.MessageCreate, async (message) => {
 
     // In any channel, @Duro followed by a question gets an answer (this needs no slash-command permission)
     const mentionPattern = new RegExp(`<@!?${client.user.id}>`, 'g');
-    const mentioned = message.mentions.users.has(client.user.id) && !message.mentions.everyone;
+    // A message that pings @everyone is not treated as talking to Duro, except when the owner or an admin writes it (for "@Duro mention @everyone ...")
+    const staffSender = getSenderRole(message.author, message.member?.permissions, message.guild) !== 'member';
+    const mentioned = message.mentions.users.has(client.user.id) && (!message.mentions.everyone || staffSender);
     const inAiChannel = activeChannels.has(message.channel.id);
     if (!inAiChannel && !mentioned) {
         // Not talking to Duro, but maybe talking about it ("duro is smart"): sometimes react with an emoji
