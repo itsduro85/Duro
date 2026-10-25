@@ -616,7 +616,12 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
         channelModels.get(channelId),
         ...MODEL_CHAIN
     ].filter(Boolean))];
-    const ready = preferred.filter(model => !isResting(model));
+    let ready = preferred.filter(model => !isResting(model));
+    // Pictures, PDFs and files are slow with the stronger model: use the light model first (unless someone chose a model on purpose)
+    const hasFiles = contents.some(entry => entry.parts?.some(part => part.inlineData));
+    if (hasFiles && !userModels.get(userId) && !channelModels.get(channelId)) {
+        ready = [...ready.filter(model => /lite/i.test(model)), ...ready.filter(model => !/lite/i.test(model))];
+    }
     const tried = new Set();
 
     // Returns the answer text, or undefined when none of these models could answer
