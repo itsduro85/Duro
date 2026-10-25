@@ -63,7 +63,7 @@ const MAX_HISTORY_MESSAGES = 12;          // short memory per channel (user + bo
 const MAX_IMAGES_PER_MESSAGE = 4;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per image
 const REQUEST_TIMEOUT_MS = 30_000;        // give up on a stuck model (questions with pictures, PDFs or files, which take longer)
-const TEXT_REQUEST_TIMEOUT_MS = 12_000;   // plain text questions: if a model hasn't answered in 12 seconds, switch to the next one
+const TEXT_REQUEST_TIMEOUT_MS = 25_000;   // plain text questions: the stronger model needs longer; if a model has not answered in 25 seconds, switch to the next one
 const DISCORD_CHUNK_SIZE = 1900;          // Discord's hard limit is 2000 characters
 
 // Who is trusted. This is checked with Discord's own data, NEVER by what someone types in a message
