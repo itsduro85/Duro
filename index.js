@@ -2305,53 +2305,12 @@ function shouldIgnoreMessage(message, hasImages) {
 }
 
 // ---------------------------------------------------------------------------
-// Diagnostic: whenever someone writes @everyone / @here, Duro reports in the mod-log channel whether Discord counted it as a REAL ping,
-// whether the person is allowed to ping in that channel, and which roles or channel overrides give them the permission.
-// ---------------------------------------------------------------------------
-const everyoneReportedAt = new Map();
-async function reportEveryoneMention(message) {
-    if (!message.guild || !/@(everyone|here)\b/i.test(message.content)) return;
-    if (Date.now() - (everyoneReportedAt.get(message.author.id) ?? 0) < 60_000) return; // at most one report per person per minute
-    everyoneReportedAt.set(message.author.id, Date.now());
-
-    const yesNo = value => (value === undefined || value === null ? 'unknown' : value ? 'YES' : 'no');
-    const member = message.member;
-    const channelPerms = member ? message.channel.permissionsFor(member) : null;
-    const canPing = channelPerms?.has(PermissionFlagsBits.MentionEveryone);
-    const isAdministrator = channelPerms?.has(PermissionFlagsBits.Administrator);
-
-    // Roles this person has that give the permission at server level (the @everyone role is checked separately)
-    const grantingRoles = member
-        ? [...member.roles.cache.values()]
-            .filter(role => role.id !== message.guild.id && (role.permissions.has(PermissionFlagsBits.Administrator) || role.permissions.has(PermissionFlagsBits.MentionEveryone)))
-            .map(role => `${role.name}${role.permissions.has(PermissionFlagsBits.Administrator) ? ' (Administrator)' : ''}`)
-        : [];
-    const everyoneRole = message.guild.roles.everyone.permissions;
-
-    // Channel rows (roles or members) that explicitly allow it in this channel
-    const allowingOverrides = [...message.channel.permissionOverwrites?.cache?.values() ?? []]
-        .filter(overwrite => overwrite.allow.has(PermissionFlagsBits.MentionEveryone))
-        .map(overwrite => (overwrite.type === 0 ? (message.guild.roles.cache.get(overwrite.id)?.name ?? overwrite.id) : `member ${overwrite.id}`));
-
-    const author = member?.displayName || message.author.username;
-    const report =
-        `🔔 ${author} wrote @​everyone/@​here in <#${message.channel.id}>\n` +
-        `• Discord counted it as a REAL ping: ${yesNo(message.mentions.everyone)}\n` +
-        `• Allowed to ping here: ${yesNo(canPing)} (Administrator: ${yesNo(isAdministrator)})\n` +
-        `• Roles that give it at server level: ${grantingRoles.length ? grantingRoles.join(', ') : 'none'}\n` +
-        `• The @​everyone role itself can ping: ${yesNo(everyoneRole.has(PermissionFlagsBits.MentionEveryone))} (Administrator: ${yesNo(everyoneRole.has(PermissionFlagsBits.Administrator))})\n` +
-        `• Channel rows that allow it here: ${allowingOverrides.length ? allowingOverrides.join(', ') : 'none'}`;
-    console.log(report.replace(/\n/g, ' | '));
-    await sendModLog(report);
-}
-
-// ---------------------------------------------------------------------------
 // Owner/admin commands: "@Duro say: hello", "@Duro say in #channel: hello", "@Duro tell @Siam the rules are in #rules"
 // Duro sends the text exactly as written (no AI involved). Only verified owner/admins can do this; regular members cannot.
 // Real pings go only to members named in the text. @everyone, @here and roles never ping.
 // ---------------------------------------------------------------------------
 const ADMIN_SAY_PINGS = (process.env.ADMIN_SAY_PINGS ?? 'true').toLowerCase() !== 'false'; // false = mentions only show names, nobody gets notified
-const SAY_VERB_RE = /^(?:(?:please|pls|plz)\s+)?(say|send|post|announce|type|write|tell|ask|message|notify)\b/i;
+const SAY_VERB_RE = /^(?:(?:please|pls|plz)\s+)?(say|send|post|announce|type|write|tell|ask|message|notify|mention|ping)\b/i;
 
 // Returns { channelId, text }, { error: 'empty' }, or null when the message is not a send-this command ("tell me about Minecraft" is a normal question)
 function parseAdminSay(spokenText) {
@@ -2359,6 +2318,14 @@ function parseAdminSay(spokenText) {
     const verb = trimmed.match(SAY_VERB_RE);
     if (!verb) return null;
     let rest = trimmed.slice(verb[0].length).trimStart().replace(/^to\s+(?=<@)/i, '');
+
+    // "@Duro mention @everyone in #chill-chat saying "Hello guys!"": @everyone / @here is written in front of the text
+    let everyone = '';
+    const everyoneMatch = rest.match(/^@(everyone|here)\b\s*/i);
+    if (everyoneMatch) {
+        everyone = `@${everyoneMatch[1].toLowerCase()}`;
+        rest = rest.slice(everyoneMatch[0].length);
+    }
 
     let mentions = '';
     const mentionList = rest.match(/^<@!?\d+>(?:\s*(?:,|and|&)?\s*<@!?\d+>)*/i);
@@ -2374,14 +2341,15 @@ function parseAdminSay(spokenText) {
         rest = rest.slice(channelClause[0].length).trimStart();
     }
 
+    rest = rest.replace(/^(?:saying|that says|with the message|and say|and write|say)\b\s*[:,]?\s*/i, '');
     const hadColon = rest.startsWith(':');
     if (hadColon) rest = rest.slice(1).trimStart();
     const quoted = rest.match(/^["“](.+)["”]$/s);
     if (quoted) rest = quoted[1].trim();
 
-    if (!mentions && !channelId && !hadColon && !quoted) return null;
-    const text = [mentions, rest].filter(Boolean).join(' ').trim();
-    return text ? { channelId, text } : { error: 'empty' };
+    if (!mentions && !channelId && !hadColon && !quoted && !everyone) return null;
+    const text = [everyone, mentions, rest].filter(Boolean).join(' ').trim();
+    return rest || mentions ? { channelId, text, pingEveryone: Boolean(everyone) } : { error: 'empty' };
 }
 
 async function runAdminSay(message, command, role) {
@@ -2408,7 +2376,7 @@ async function runAdminSay(message, command, role) {
     // "#rules" and "@Name" typed as plain text become real links; mentions picked in Discord's own menu are already codes
     const text = linkChannelNames(linkSeenMembers(command.text), message.guild);
     const mentionedIds = [...new Set([...text.matchAll(/<@!?(\d+)>/g)].map(match => match[1]))].slice(0, 20);
-    const allowedMentions = { parse: [], users: ADMIN_SAY_PINGS ? mentionedIds : [], repliedUser: ADMIN_SAY_PINGS };
+    const allowedMentions = { parse: ADMIN_SAY_PINGS && command.pingEveryone ? ['everyone'] : [], users: ADMIN_SAY_PINGS ? mentionedIds : [], repliedUser: ADMIN_SAY_PINGS };   // @everyone only when the admin wrote it in the command
 
     // In the same channel, a command written as a reply to someone's message is answered under THAT message
     let replyTo = null;
@@ -2748,7 +2716,6 @@ client.on(Events.MessageCreate, async (message) => {
         return;
     }
     rememberMember(message);
-    reportEveryoneMention(message).catch(() => {});
 
     // Server rules first: this runs in EVERY channel, not only AI channels
     if (AUTOMOD_ENABLED && await runAutomod(message)) return;
