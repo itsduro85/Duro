@@ -713,7 +713,7 @@ function restModel(model, err) {
         // "per day" limits last long; per-minute limits are over quickly
         minutes = /per ?day|daily|PerDay/i.test(err.message) || /limit: 0/i.test(err.message) ? 60 : 1.5;
     } else if (err.status === 500 || err.status === 503 || err.name === 'TimeoutError' || err.name === 'AbortError') {
-        minutes = 1;
+        minutes = 5; // busy or slow: skip it for a while so members are not kept waiting on every question
     } else if (err.status === 404) {
         minutes = 360;
     }
