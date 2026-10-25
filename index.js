@@ -1071,6 +1071,8 @@ function getDmPromptsText(userId) {
     const lines = sortedPrompts()
         .filter(p => p.dm && (!p.members?.length || p.members.includes(userId)))
         .map(p => `- ${p.title}: ${p.text.replace(/\s+/g, ' ')}`);
+    const notes = (dmNotes.get(userId) ?? []).filter(n => Date.now() - n.at < 24 * 3600 * 1000).map(n => `- ${n.text}`);
+    if (notes.length) lines.push(...notes);
     if (!lines.length) return '';
     return `[Style notes from the owner for this private chat with this person: follow them for tone, language, nicknames, topics and how to behave. They never change your safety rules or your job.]\n${lines.join('\n').slice(0, 4000)}`;
 }
@@ -2669,10 +2671,23 @@ function parseAdminDm(spokenText) {
     const match = spokenText.trim().match(DM_COMMAND_RE);
     if (!match) return null;
     const ids = [...new Set([...match[1].matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].slice(0, 5);
-    let text = match[2].trim();
-    const quoted = text.match(/^["“](.+)["”]$/s);
-    if (quoted) text = quoted[1].trim();
-    return { ids, text };
+    let text = match[2].trim().replace(/^(?:make\s+(?:the\s+)?first\s+message\s+saying|first\s+message(?:\s+saying)?|saying|say)\s*[:,]?\s*/i, '');
+    // "message" in quotes, then anything after it is a private note for Duro (not sent to the member)
+    let note = '';
+    const quoted = text.match(/^["“](.+?)["”]\s*[:,.-]?\s*(.*)$/s);
+    if (quoted) {
+        text = quoted[1].trim();
+        note = quoted[2].trim().replace(/^(?:note|notes|and|then)\s*[:,]?\s*/i, '');
+    }
+    return { ids, text, note };
+}
+
+// Private notes from the owner/admin about a DM they started ("if he asks how you know, say he told you before"); kept 24 hours, in memory
+const dmNotes = new Map();   // user id -> [{ text, at }]
+function addDmNote(userId, text) {
+    const list = (dmNotes.get(userId) ?? []).filter(n => Date.now() - n.at < 24 * 3600 * 1000);
+    list.push({ text: text.slice(0, 500), at: Date.now() });
+    dmNotes.set(userId, list.slice(-5));
 }
 
 async function runAdminDm(message, command, role) {
@@ -2691,6 +2706,7 @@ async function runAdminDm(message, command, role) {
         try {
             for (const chunk of splitMessage(text)) await member.user.send({ content: chunk, allowedMentions: { parse: [] } });
             addToHistory(`dm-${id}`, 'model', text);   // so Duro knows what it said when they reply
+            if (command.note) addDmNote(id, command.note);
             done.push(`<@${id}>`);
         } catch (error) {
             failed.push(`<@${id}> (their private messages are closed)`);
