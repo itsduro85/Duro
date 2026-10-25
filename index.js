@@ -2658,6 +2658,8 @@ function parseLooseAdminDm(spokenText) {
 }
 
 function parseAdminDm(spokenText) {
+    // A bare user ID (copied with "Copy User ID") is accepted too: 1543647126624542892 -> <@1543647126624542892>
+    spokenText = spokenText.replace(/(?<![<@&#!\d])(\d{17,20})(?![\d>])/g, '<@$1>');
     const match = spokenText.trim().match(DM_COMMAND_RE);
     if (!match) return parseLooseAdminDm(spokenText);
     const ids = [...new Set([...match[1].matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].slice(0, 5);
