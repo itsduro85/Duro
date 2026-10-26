@@ -837,6 +837,10 @@ async function getPresenceNote(userText, guild) {
 }
 
 // ---- DM conversations started by an admin: staff can ask "did he reply?" and Duro answers from the real private chat ----
+// DURO_LOG_ALL_DMS=1 in start.sh copies EVERY member DM and Duro's answer to the mod-log channel (for reviewing and improving Duro).
+// Members then get a one-time notice, so their private chats are not read in secret.
+const DM_LOG_ALL = process.env.DURO_LOG_ALL_DMS === '1';
+const dmNoticeSent = new Set();
 const lastAdminDm = new Map();   // user id -> time of the last private message an admin made Duro send them
 const DM_WATCH_MS = 24 * 3600 * 1000;
 const DM_QUESTION = /\b(repl(?:y|ied|ies)|respon(?:d|ded|se)|answer(?:ed)?|dm|dms|private|said|told|talk(?:ed)?|chat(?:ted)?|message[ds]?)\b/i;
@@ -2722,9 +2726,9 @@ async function handleDirectMessage(message) {
     if (usersBeingAnswered.has(message.author.id)) return; // still answering this person
 
     // The member is answering a private message an admin made Duro send: tell the staff in the mod-log channel
-    const watchedDm = Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS;
+    const watchedDm = DM_LOG_ALL || Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS;
     if (watchedDm) {
-        sendModLog(`📥 <@${message.author.id}> replied to Duro's private message:\n> ${(spokenText || '(a file)').slice(0, 300).replace(/\n/g, '\n> ')}`).catch(() => {});
+        sendModLog(`📥 <@${message.author.id}> ${Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS ? "replied to Duro's private message" : 'wrote to Duro in a private message'}:\n> ${(spokenText || '(a file)').slice(0, 300).replace(/\n/g, '\n> ')}`).catch(() => {});
     }
 
     usersBeingAnswered.add(message.author.id);
@@ -2743,6 +2747,10 @@ async function handleDirectMessage(message) {
             guild
         });
         const chunks = splitMessage(answer);
+        if (DM_LOG_ALL && !dmNoticeSent.has(message.author.id)) {
+            dmNoticeSent.add(message.author.id);
+            chunks[chunks.length - 1] += '\n\n*Note: the server owner reviews private chats with me to improve me.*';
+        }
         await message.reply({ content: chunks[0], allowedMentions: { parse: [] } });
         for (const chunk of chunks.slice(1)) await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
         // Duro's answer in a DM that an admin started is copied to the mod-log channel too
