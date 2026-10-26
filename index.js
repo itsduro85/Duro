@@ -59,7 +59,9 @@ const MODEL_CHAIN = [...new Set([
 ])];
 
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const MAX_HISTORY_MESSAGES = 12;          // short memory per channel (user + bot messages)
+const MAX_HISTORY_MESSAGES = 200;         // everything Duro remembers per channel or DM (user + bot messages), kept in memory
+const RECENT_HISTORY_MESSAGES = 24;       // normally only the newest messages are sent to the AI (fast)
+const DEEP_HISTORY_MESSAGES = 150;        // when the question is about something older, many more are sent (slower, but more complete)
 const MAX_IMAGES_PER_MESSAGE = 4;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per image
 const REQUEST_TIMEOUT_MS = 30_000;        // give up on a stuck model (questions with pictures, PDFs or files, which take longer)
@@ -756,6 +758,29 @@ function friendlyErrorMessage(err) {
     return '⚠️ Something went wrong while thinking about that. Please try again.';
 }
 
+// Which part of the remembered chat goes to the AI: the newest messages, or far more when the question points to something older
+const OLD_REFERENCE_PATTERN = /\b(earlier|before|previously|previous|yesterday|last (?:time|week|night|day)|ago|remember|remind|recall|you (?:said|told|mentioned|promised|asked)|i (?:said|told|asked|mentioned)|we (?:talked|discussed|spoke|said)|(?:talked|discussed|spoke) about|that thing|what was|what were|what did|back then|first message)\b/i;
+const HISTORY_STOP_WORDS = new Set(['this', 'that', 'with', 'what', 'when', 'where', 'which', 'would', 'could', 'should', 'about', 'there', 'their', 'have', 'from', 'your', 'they', 'them', 'then', 'than', 'been', 'were', 'will', 'just', 'like', 'know', 'tell', 'please', 'duro', 'does', 'also', 'into', 'some', 'more', 'only', 'very', 'much', 'many', 'here', 'bro']);
+
+function selectHistory(history, userText) {
+    if (history.length <= RECENT_HISTORY_MESSAGES) return history;
+    const older = history.slice(0, history.length - RECENT_HISTORY_MESSAGES);
+    let deep = OLD_REFERENCE_PATTERN.test(userText);
+    if (!deep) {
+        // Do words of the question (names, topics) appear in the older messages?
+        const words = [...new Set(userText.toLowerCase().split(/[^\p{L}\p{N}_]+/u).filter(w => w.length >= 4 && !HISTORY_STOP_WORDS.has(w)))];
+        if (words.length) {
+            const olderText = older.map(entry => entry.parts?.[0]?.text ?? '').join('\n').toLowerCase();
+            const hits = words.filter(w => olderText.includes(w)).length;
+            deep = hits >= Math.min(2, words.length);
+        }
+    }
+    let chosen = history.slice(-(deep ? DEEP_HISTORY_MESSAGES : RECENT_HISTORY_MESSAGES));
+    while (chosen.length > 1 && chosen[0].role !== 'user') chosen = chosen.slice(1);   // Gemini wants the chat to start with a person's message
+    if (deep) console.log(`[memory] question points to older messages: sending ${chosen.length} remembered messages`);
+    return chosen;
+}
+
 function addToHistory(channelId, role, text) {
     const history = channelHistory.get(channelId) ?? [];
     history.push({ role, parts: [{ text }] });
@@ -896,7 +921,7 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
 
     // The role tag is added by the code from Discord's data, so the AI can tell who is really an admin
     const promptText = `${author} [${senderRole}]: ${userText}`;
-    const history = channelHistory.get(channelId) ?? [];
+    const history = selectHistory(channelHistory.get(channelId) ?? [], userText);
 
     // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
     const compareNote = getNumberCompareNote(userText);   // numbers like 1.9 and 1.11 are checked by the code: no web search needed
@@ -2873,6 +2898,16 @@ client.on(Events.MessageCreate, async (message) => {
     // Is the message talking to Duro? An @mention anywhere, or the name "Duro" inside an AI channel
     const addressed = mentioned || (inAiChannel && /\bduro\b/i.test(message.content));
     if (!spokenText && !hasImages && !mentioned) return;
+
+    // In an AI channel, a reply to ANOTHER member's message is not for Duro (unless it mentions Duro or says "Duro")
+    if (inAiChannel && !addressed && !watched && message.reference?.messageId) {
+        const repliedTo = message.channel.messages.cache.get(message.reference.messageId)
+            ?? await message.channel.messages.fetch(message.reference.messageId).catch(() => null);
+        if (repliedTo && repliedTo.author.id !== client.user.id) {
+            console.log(`Ignored a reply from ${message.author.username} to ${repliedTo.author.username} in the AI channel (not meant for Duro).`);
+            return;
+        }
+    }
 
     // In an AI channel, messages that mean nothing (random emoji, GIF or link only, "ok", "lol", gibberish)
     // are removed, unless they react to something Duro said. Staff are never touched.
