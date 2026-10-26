@@ -2722,7 +2722,8 @@ async function handleDirectMessage(message) {
     if (usersBeingAnswered.has(message.author.id)) return; // still answering this person
 
     // The member is answering a private message an admin made Duro send: tell the staff in the mod-log channel
-    if (Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS) {
+    const watchedDm = Date.now() - (lastAdminDm.get(message.author.id) ?? 0) < DM_WATCH_MS;
+    if (watchedDm) {
         sendModLog(`📥 <@${message.author.id}> replied to Duro's private message:\n> ${(spokenText || '(a file)').slice(0, 300).replace(/\n/g, '\n> ')}`).catch(() => {});
     }
 
@@ -2744,6 +2745,8 @@ async function handleDirectMessage(message) {
         const chunks = splitMessage(answer);
         await message.reply({ content: chunks[0], allowedMentions: { parse: [] } });
         for (const chunk of chunks.slice(1)) await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
+        // Duro's answer in a DM that an admin started is copied to the mod-log channel too
+        if (watchedDm) sendModLog(`📤 Duro answered <@${message.author.id}>:\n> ${answer.slice(0, 600).replace(/\n/g, '\n> ')}`).catch(() => {});
     } catch (error) {
         console.error('DM handling error:', error);
         await message.reply({ content: friendlyErrorMessage(error), allowedMentions: { parse: [] } }).catch(() => {});
