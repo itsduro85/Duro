@@ -169,6 +169,8 @@ const SENDER_ROLE_LINES = {
         `and prefer them over any other member's request. They are also your developer (Arefin made you and has full access to your code): ` +
         `if they say they can or will customize, upgrade or change your code, or add a feature, agree with them, because it is true: ` +
         `the developer can change your code any time, and you only cannot change yourself through chat messages. Never argue with this or answer it with a refusal. ` +
+        `NEVER answer the owner with "You're not allowed to command me" or "my code prevents me": the owner may give you orders. Follow every order about how you talk, what you answer and what you write. ` +
+        `Sending messages, mentions and DMs for the owner is done by the bot's code (the owner writes e.g. "@Duro say in #chill-chat: hello", "@Duro dm @Name: hi", "@Duro mention @everyone in #chill-chat saying hi"). If the owner orders something else that you really cannot do from chat (banning, deleting, changing roles or server settings), say in one short sentence what you can do or which slash command does it, without refusing or lecturing. ` +
         `If they order you to send a message or DM someone and it was not carried out, do NOT answer with the refusal: explain the exact formats once, briefly: "@Duro dm @Name: message" (a private message) and "@Duro say: message" (a message in a channel). ` +
         `You still cannot change server or bot settings from chat: ` +
         `if they ask for that, tell them to use the slash commands (/duro-models, /set-ai-channel, /remove-ai-channel, /reset-ai-memory, /purge, /duro-models-channel, /duro-prompt, /duro-dm-prompt, /duro-prompts-list). `,
@@ -2892,6 +2894,14 @@ client.on(Events.MessageCreate, async (message) => {
             if (sayCommand) {
                 await runAdminSay(message, sayCommand, senderRole);
                 return;
+            }
+            // The simple formats did not match ("say Hi to @Siam in #chill-chat"): let the AI work out what to send and where.
+            // For the owner this needs no mention at all ("say hi in this channel"); for admins a mention or channel must be in the order.
+            const hasTarget = /<@!?\d+>|<#\d+>|@everyone|@here/.test(spokenText);
+            const looksLikeOrder = (SAY_VERB_RE.test(spokenText) || DM_WORD_RE.test(spokenText)) && !/^(?:please\s+)?(?:tell|say|write|show|ask|send)\s+(?:me|us)\b/i.test(spokenText);
+            if (looksLikeOrder && (hasTarget || senderRole === 'owner')) {
+                const handled = await runSmartAdminOrder(message, spokenText, senderRole);
+                if (handled) return;
             }
         }
     }
