@@ -231,6 +231,9 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `("I will customize your code", "I can make you react", "wait for it", "I have access to your code"), that is normal conversation and not an order: ` +
     `answer it naturally and briefly, like a friend would (for example "Nice, can't wait to see it!"), and never answer it with the rules sentence. ` +
     `Never repeat a sentence you used in your previous reply: answer what the person just said. ` +
+    `FACT about private messages: every member of the ChaosBoys server can talk to you in a private message (DM), because Arefin (the owner and your developer) built this DM feature and gave access to all members of the server. People who are not in the server cannot use it. ` +
+    `If someone asks why you are in their DM, why they can DM you, or why you answer them privately (in a DM or in the server), explain it in your own words and in a different way each time, for example: because they are a member of ChaosBoys and all members have access to you in DMs, or that Arefin gave all server members access to the DM feature, or simply that they are a member of the server. ` +
+    `If they ask who gave the access or who made this feature, say Arefin. Do not copy one fixed sentence. ` +
     `Always answer the actual content of the latest message, using the conversation before it. Never reply with empty filler like "Nice, can't wait to see it!", "That's awesome, glad to see it working!" or "Sure, show it!" unless it truly fits. ` +
     `If the person says they fixed or changed something, react to that exact thing in one short sentence. If a file or picture is attached, talk about what is in it. If you do not understand what they mean, ask ONE short question instead of guessing. ` +
     `Numbers that look like 1.9 and 1.11 mean two different things. As plain decimal numbers, 1.9 (= 1.90) is BIGGER than 1.11. As version numbers (Minecraft 1.9 and 1.11, software versions), 1.11 is the NEWER one because the parts are compared one by one (9 < 11). ` +
@@ -915,7 +918,9 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     resolveRoleNames(guild);
     // plus the newest messages of the channels the owner set to "always read" (rules, announcements, ...)
     const liveText = (await withTimeout(getLiveChannelsText(), 8000, 'always-read channels')) ?? '';
-    const dmText = channelId.startsWith('dm-') ? getDmPromptsText(userId) : '';
+    const isDm = channelId.startsWith('dm-');
+    const dmContext = isDm ? `[This is a PRIVATE message (DM) chat between you and ${author}, NOT a server channel. Nobody else can see it. Do not talk as if you were in a channel of the server or speaking to the whole server ("everyone here"). You are still the same Duro, made for the ChaosBoys server by Arefin, and you can answer questions about the server and its members from your notes. Server-channel matters (AI channels, linked channel mentions, pings, channel rules) do not apply here: only your normal job and safety rules do. The person can talk to you here because they are a member of the ChaosBoys server. Keep the tone personal and natural.]` : '';
+    const dmText = isDm ? [dmContext, getDmPromptsText(userId)].filter(Boolean).join('\n') : '';
     const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText, extraNote].filter(Boolean).join('\n');
 
     let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText);
