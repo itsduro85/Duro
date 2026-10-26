@@ -660,6 +660,7 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
 
                 if (text) {
                     // Diagnostic: shows in Render logs whether Google Search was really used for this answer
+                    modelFailStreak.delete(model);
                     console.log(`Answered with model=${model}, googleSearch=${withSearch}, grounded=${Boolean(candidate?.groundingMetadata)}, webResults=${hasWebResults}, version=${data.modelVersion ?? 'unknown'}, took=${Date.now() - startedAt}ms`);
                     return text;
                 }
@@ -724,13 +725,17 @@ function isResting(model) {
     return (modelRestUntil.get(model) ?? 0) > Date.now();
 }
 
+const modelFailStreak = new Map(); // model id -> failures in a row (reset when it answers); the longer it keeps failing, the longer it rests
+
 function restModel(model, err) {
     let minutes = 0;
     if (err.status === 429) {
         // "per day" limits last long; per-minute limits are over quickly
         minutes = /per ?day|daily|PerDay/i.test(err.message) || /limit: 0/i.test(err.message) ? 60 : 1.5;
     } else if (err.status === 500 || err.status === 503 || err.name === 'TimeoutError' || err.name === 'AbortError') {
-        minutes = 5; // busy or slow: skip it for a while so members are not kept waiting on every question
+        const streak = (modelFailStreak.get(model) ?? 0) + 1;
+        modelFailStreak.set(model, streak);
+        minutes = Math.min(5 * 3 ** (streak - 1), 180); // busy or slow: rest 5, 15, 45, 135, then 180 minutes while it keeps failing
     } else if (err.status === 404) {
         minutes = 360;
     }
