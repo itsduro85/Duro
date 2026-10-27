@@ -30,6 +30,7 @@ import http from 'http';
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
 //           ALLOWED_MODELS      (models people can pick with /duro-models and /my-duro-models, default: all models that have free quota; list names to show only those, or put them in this variable to override the hiding)
+//           ANNOUNCEMENT_CHANNEL_ID, MCSMP_CHANNEL_ID  (optional: exact channel IDs Duro reads when it writes a message about announcements / the Minecraft server; without them it looks for channels named "announce..." and "mc-smp")
 //           PROMPTS_CHANNEL_ID  (optional: channel where saved prompts are stored; by default Duro makes a hidden #duro-prompts channel itself)
 //           (linked channels: Duro needs View Channel + Read Message History in a channel to "always read" it)
 //           MODELS_CHANNEL_ID   (channel IDs, like #cmd, where everyone may use /my-duro-models; AI channels always allow it)
@@ -2417,9 +2418,10 @@ function parseAdminSay(spokenText) {
     const quoted = rest.match(/^["“](.+)["”]$/s);
     if (quoted) rest = quoted[1].trim();
 
-    if (!mentions && !channelId && !hadColon && !quoted && !everyone) return null;
+    if (!hadColon && !quoted && !everyone) return null;   // no exact words given: the AI writes the message (see runSmartAdminOrder)
     const text = [everyone, mentions, rest].filter(Boolean).join(' ').trim();
-    return rest || mentions ? { channelId, text, pingEveryone: Boolean(everyone) } : { error: 'empty' };
+    const mentionIds = [...new Set([...mentions.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))];
+    return rest || mentions ? { channelId, text, pingEveryone: Boolean(everyone), mentionIds, bodyText: rest } : { error: 'empty' };
 }
 
 // ---- Smart orders: when an admin's order also says what to do AFTERWARDS ("...when he replies, say ..."), the AI splits it into
@@ -2455,48 +2457,137 @@ async function askGeminiJson(prompt) {
     return null;
 }
 
-// Returns { kind: 'say' | 'dm', ids, channelId, text, followup, pingEveryone } or null when the AI is unsure
+// Plain-text version of askGeminiJson: used to write the message Duro sends when the admin did not give the exact words
+async function askGeminiText(prompt) {
+    const models = MODEL_CHAIN.filter(m => !isResting(m));
+    for (const model of models.slice(0, 2)) {
+        try {
+            const res = await fetch(`${GEMINI_BASE_URL}/${model}:generateContent`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+                body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { temperature: 0.6, maxOutputTokens: 1200 } }),
+                signal: AbortSignal.timeout(40_000)
+            });
+            if (!res.ok) continue;
+            const data = await res.json();
+            const text = (data.candidates?.[0]?.content?.parts ?? []).filter(p => p.text && !p.thought).map(p => p.text).join('').trim();
+            if (text) return text;
+        } catch (error) {
+            console.warn(`Message writing failed on ${model}: ${error.message}`);
+        }
+    }
+    return null;
+}
+
+const HERE_RE = /\b(?:here|in this channel|in the channel|in this chat|in this room)\b/i;
+// The channels Duro reads when it writes a message for the owner. An ID is exact and survives renaming; without an ID Duro looks for the name.
+// Set ANNOUNCEMENT_CHANNEL_ID and MCSMP_CHANNEL_ID (in start.sh) or put the IDs here.
+const ANNOUNCEMENT_CHANNEL_ID = process.env.ANNOUNCEMENT_CHANNEL_ID || '';
+const MCSMP_CHANNEL_ID = process.env.MCSMP_CHANNEL_ID || '';
+function findAdminSourceChannel(guild, id, regex) {
+    const byId = id ? guild.channels.cache.get(id) : null;
+    if (byId?.isTextBased()) return byId;
+    return guild.channels.cache.find(c => c.isTextBased() && !c.isThread() && c.id !== promptStore?.id && regex.test(c.name));
+}
+
+// Returns the plan for an owner/admin order, or null when the AI is unsure.
+// exactText = the admin gave the exact words (in quotes or after a colon); otherwise intent = what Duro should tell or ask in its own words.
 async function planAdminOrder(spokenText) {
     const userIds = [...new Set([...spokenText.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))].filter(id => id !== client.user?.id);
     const channelIds = [...new Set([...spokenText.matchAll(/<#(\d+)>/g)].map(m => m[1]))];
     const prompt =
-        `An admin gave a Discord bot this order. The order may contain (1) a message to send now and (2) private instructions for what the bot should do later, ` +
+        `An admin gave a Discord bot this order. It may contain (1) something to send now to a person or a channel and (2) private instructions for what the bot should do later, ` +
         `for example if the person replies. Split it. Mentions are written as <@id> (people) and <#id> (channels).\n\n` +
         `ORDER:\n${spokenText}\n\n` +
-        `Answer ONLY with JSON: {"kind":"say"|"dm"|"none","targets":[user ids the message is for],"channelId":"channel id or null","pingEveryone":false,` +
-        `"message":"the exact text to send now (if it is for a person in a channel, start it with their <@id>; keep the admin's own words, quotes removed)","followup":"the private instructions for later, written as instructions to the bot (empty if none)"}.\n` +
-        `Rules: kind "dm" when the order says DM/private message, otherwise "say" (post in a channel; channelId null means the current channel). ` +
-        `Never put the private instructions inside "message". Only use ids that appear in the order. Use "none" if this is not an order to send something.`;
+        `Answer ONLY with JSON: {"kind":"send"|"none","targets":[user ids the message is for],"channelId":"channel id from the order or null","here":false,"pingEveryone":false,` +
+        `"exactText":"","intent":"","topic":"announcement"|"minecraft"|"other","followup":""}.\n` +
+        `exactText: ONLY when the admin wrote the exact words to send (in quotes or after a colon); otherwise "". ` +
+        `intent: when there is no exact text, what the bot should tell or ask, in plain words (for example "ask him if he finished his school homework", "tell him about the upcoming event"). ` +
+        `topic: "announcement" when it is about an upcoming event, news or announcements; "minecraft" when it is about the Minecraft server address, how to join, or important notes about the Minecraft server; otherwise "other". ` +
+        `here: true only if the admin said "here" or "in this channel". followup: private instructions for later, written as instructions to the bot (empty if none). ` +
+        `Never put the private instructions inside exactText or intent. Only use ids that appear in the order. Use "none" if this is not an order to send something.`;
     const plan = await askGeminiJson(prompt);
-    if (!plan || (plan.kind !== 'say' && plan.kind !== 'dm')) return null;
+    if (!plan || plan.kind !== 'send') return null;
     const ids = (Array.isArray(plan.targets) ? plan.targets : []).map(String).filter(id => userIds.includes(id)).slice(0, 5);
     const channelId = plan.channelId && channelIds.includes(String(plan.channelId)) ? String(plan.channelId) : null;
-    let text = String(plan.message ?? '').trim().slice(0, 1500);
-    if (!text) return null;
-    if (plan.kind === 'say') text = text.replace(/<@!?(\d+)>/g, (m, id) => (userIds.includes(id) ? m : ''));
-    if (plan.kind === 'dm' && !ids.length) return null;
+    const exactText = String(plan.exactText ?? '').trim().slice(0, 1500);
+    const intent = String(plan.intent ?? '').trim().slice(0, 600);
+    if (!exactText && !intent) return null;
     return {
-        kind: plan.kind, ids, channelId, text,
+        ids, channelId,
+        here: Boolean(plan.here) && HERE_RE.test(spokenText),
+        exactText, intent,
+        topic: ['announcement', 'minecraft'].includes(plan.topic) ? plan.topic : 'other',
         followup: String(plan.followup ?? '').trim().slice(0, 600),
         pingEveryone: Boolean(plan.pingEveryone) && /@(everyone|here)\b/i.test(spokenText)
     };
 }
 
+// Writes the message in Duro's own words, using the real channels (announcements, #mc-smp) and the saved prompts as information
+async function composeAdminMessage(message, plan, toDm) {
+    const guild = message.guild;
+    const sources = [];
+    const wanted = plan.topic === 'announcement' ? findAdminSourceChannel(guild, ANNOUNCEMENT_CHANNEL_ID, /announce/i)
+        : plan.topic === 'minecraft' ? findAdminSourceChannel(guild, MCSMP_CHANNEL_ID, /mc-smp/i) : null;
+    if (wanted) {
+        const text = await readChannelMessages(wanted.id);
+        if (text) sources.push(`Newest messages of the channel #${wanted.name} (the newest are at the bottom; use the dates):\n${text}`);
+    }
+    const notes = getRelevantPromptsText(`${plan.intent} ${plan.topic}`);
+    if (notes) sources.push(`Saved notes about the server:\n${notes}`);
+
+    const names = [];
+    for (const id of plan.ids) {
+        const member = guild.members.cache.get(id) ?? await guild.members.fetch(id).catch(() => null);
+        names.push(member?.displayName ?? 'the member');
+    }
+    const prompt =
+        `You are Duro, the AI assistant of the ChaosBoys Discord server (made by Arefin, the server owner). The owner ordered you to send a message${names.length ? ` to ${names.join(' and ')}` : ''}.\n` +
+        `ORDER (what to tell or ask): ${plan.intent}\n\n` +
+        `Write the message you will send. Rules: write it in your own words, friendly and natural, like a helpful friend, not a robot. Keep it short (a few lines) unless the information needs more. ` +
+        `Use the person's language style (Banglish or English). Use ONLY facts from the sources below: if they do not contain what is needed, say what you do know and do not invent dates, addresses, prizes or rules. ` +
+        `${plan.topic === 'announcement' ? 'Tell about the most recent relevant announcement(s) and say how recent they are. ' : ''}` +
+        `${plan.topic === 'minecraft' ? 'Explain the server address, how to join and the important notes clearly, step by step if needed. ' : ''}` +
+        `${toDm ? `This is a private message: greet them by name${names.length ? ` (${names.join(', ')})` : ''}, no mention codes. ` : `This is posted in a channel: start with ${plan.ids.map(id => `<@${id}>`).join(' ') || 'no mention'}. `}` +
+        `Never write @everyone or @here. Never say that anyone ordered you unless the order says to. Output ONLY the message text.\n\n` +
+        `${sources.length ? sources.join('\n\n') : '(no extra sources)'}`;
+    let text = await askGeminiText(prompt);
+    if (!text) return null;
+    text = removeMentionCodes(text, new Set(plan.ids)).replace(/<@!?\d+>/g, m => m);   // only the targeted people can be mentioned
+    return text.slice(0, 1900);
+}
+
 async function runSmartAdminOrder(message, spokenText, role) {
     const plan = await planAdminOrder(spokenText);
     if (!plan) return false;
-    if (plan.kind === 'dm') {
-        return runAdminDm(message, { ids: plan.ids, text: plan.text, note: plan.followup }, role);
+    const answerAdmin = content => message.reply({ content, allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
+
+    // Where does it go? A person is messaged by DM unless a channel is named ("in #chill-chat") or the admin says "here" / "in this channel".
+    // No person (or @everyone): a channel, the named one or the current one.
+    let toDm = plan.ids.length > 0 && !plan.pingEveryone && !plan.channelId && !plan.here;
+    if (DM_WORD_RE.test(spokenText) && plan.ids.length && !plan.channelId) toDm = true;
+
+    let text = plan.exactText;
+    if (!text) {
+        message.channel.sendTyping().catch(() => {});
+        text = await composeAdminMessage(message, plan, toDm);
+        if (!text) { await answerAdmin("I couldn't write that message (the AI did not answer). Please try again."); return false; }
     }
-    if (plan.pingEveryone && !/@(everyone|here)\b/i.test(plan.text)) plan.text = `${/@here\b/i.test(spokenText) && !/@everyone\b/i.test(spokenText) ? '@here' : '@everyone'} ${plan.text}`;
-    const sent = await runAdminSay(message, { channelId: plan.channelId, text: plan.text, pingEveryone: plan.pingEveryone }, role);
-    if (sent && plan.followup) {
-        const watchChannel = plan.channelId ?? message.channel.id;
-        const watchIds = plan.ids.length ? plan.ids : [...new Set([...plan.text.matchAll(/<@!?(\d+)>/g)].map(m => m[1]))];
-        const note = `${plan.followup} (Duro first wrote: "${plan.text.slice(0, 200)}")`;
-        if (watchIds.length) for (const id of watchIds.slice(0, 5)) addChannelWatch(watchChannel, id, note);
-        else addChannelWatch(watchChannel, '*', note);   // for everyone: answers members who reply to Duro's message or mention Duro
-        await sendModLog(`👀 Duro will follow your private instructions ${watchIds.length ? `when ${watchIds.map(id => `<@${id}>`).join(', ')} replies` : 'when anyone replies to its message or mentions it'} in <#${watchChannel}> (for 6 hours): ${plan.followup.slice(0, 300)}`);
+
+    let sent;
+    if (toDm) {
+        sent = await runAdminDm(message, { ids: plan.ids, text, note: plan.followup }, role);
+    } else {
+        if (plan.ids.length && !plan.pingEveryone && !/<@!?\d+>/.test(text)) text = `${plan.ids.map(id => `<@${id}>`).join(' ')} ${text}`;
+        if (plan.pingEveryone && !/@(everyone|here)\b/i.test(text)) text = `${/@here\b/i.test(spokenText) && !/@everyone\b/i.test(spokenText) ? '@here' : '@everyone'} ${text}`;
+        sent = await runAdminSay(message, { channelId: plan.channelId, text, pingEveryone: plan.pingEveryone }, role);
+        if (sent && plan.followup) {
+            const watchChannel = plan.channelId ?? message.channel.id;
+            const note = `${plan.followup} (Duro first wrote: "${text.slice(0, 200)}")`;
+            if (plan.ids.length) for (const id of plan.ids.slice(0, 5)) addChannelWatch(watchChannel, id, note);
+            else addChannelWatch(watchChannel, '*', note);   // for everyone: answers members who reply to Duro's message
+            await sendModLog(`👀 Duro will follow your private instructions ${plan.ids.length ? `when ${plan.ids.map(id => `<@${id}>`).join(', ')} replies` : 'when anyone replies to its message or mentions it'} in <#${watchChannel}> (for 6 hours): ${plan.followup.slice(0, 300)}`);
+        }
     }
     return sent;
 }
@@ -2961,7 +3052,12 @@ client.on(Events.MessageCreate, async (message) => {
             }
             const sayCommand = parseAdminSay(spokenText);
             if (sayCommand) {
-                await runAdminSay(message, sayCommand, senderRole);
+                // Exact words for a person: sent by DM unless a channel is named or the admin says "here" / "in this channel"
+                if (sayCommand.mentionIds?.length && sayCommand.bodyText && !sayCommand.channelId && !sayCommand.pingEveryone && !HERE_RE.test(spokenText)) {
+                    await runAdminDm(message, { ids: sayCommand.mentionIds.slice(0, 5), text: sayCommand.bodyText, note: '' }, senderRole);
+                } else {
+                    await runAdminSay(message, sayCommand, senderRole);
+                }
                 return;
             }
             // The simple formats did not match ("say Hi to @Siam in #chill-chat"): let the AI work out what to send and where.
