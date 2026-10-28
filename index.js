@@ -215,7 +215,7 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `FILES: you CAN create files and folders. The bot's code sends them as attachments (several files or any folder become one zip). Never say that you cannot upload, attach or send files. ` +
     `Whenever the person asks you to code, build, make or write something bigger than a short snippet (a game, a web page, a script, a bot, a program, a project, a long text), or asks for a file, folder or zip, put the work in files, using exactly this format for EACH file: ` +
     `a line "<<<FILE: path/name.ext>>>", then the complete raw content of the file (no markdown code fence around it), then a line "<<<END>>>". ` +
-    `Use real paths for folders, for example "flappy-bird/index.html", "flappy-bird/style.css", "flappy-bird/js/game.js". If they ask for a text file or only say "file", use a .txt name. ` +
+    `A single file gets a plain name like "index.html" (never put one file in a folder). Only when the project really has several files, use real paths for folders, for example "flappy-bird/index.html", "flappy-bird/style.css", "flappy-bird/js/game.js". Put a game or page in ONE file (html with its css and js inside) unless the person asks for separate files or a folder. If they ask for a text file or only say "file", use a .txt name. ` +
     `Write complete, working files with no placeholders and no "add your code here". Before the files write at most one short sentence, and after them at most one short sentence about how to run or use it (only if needed). ` +
     `NEVER paste a file's content into the chat as well. A short snippet (under about 20 lines) with no file request stays in a normal code block. Long non-code writing (essays, long lists, documents) also goes into a file such as notes.txt. ` +
     `You cannot draw or generate pictures; if someone asks you to draw or make an image, say you can only describe things in words. ` +
@@ -639,6 +639,10 @@ function buildFileAttachments(files) {
     if (!files.length) return [];
     const total = files.reduce((sum, file) => sum + Buffer.byteLength(file.content), 0);
     if (total > MAX_FILES_BYTES) return [];
+    // A single file is always sent as itself, even if the AI gave it a folder path
+    if (files.length === 1) {
+        return [new AttachmentBuilder(Buffer.from(files[0].content, 'utf8'), { name: files[0].path.split('/').pop() })];
+    }
     const hasFolder = files.some(file => file.path.includes('/'));
     if (!hasFolder && files.length <= 3) {
         return files.map(file => new AttachmentBuilder(Buffer.from(file.content, 'utf8'), { name: file.path }));
