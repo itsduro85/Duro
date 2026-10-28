@@ -2482,8 +2482,8 @@ async function askGeminiText(prompt) {
 const HERE_RE = /\b(?:here|in this channel|in the channel|in this chat|in this room)\b/i;
 // The channels Duro reads when it writes a message for the owner. An ID is exact and survives renaming; without an ID Duro looks for the name.
 // Set ANNOUNCEMENT_CHANNEL_ID and MCSMP_CHANNEL_ID (in start.sh) or put the IDs here.
-const ANNOUNCEMENT_CHANNEL_ID = process.env.ANNOUNCEMENT_CHANNEL_ID || '';
-const MCSMP_CHANNEL_ID = process.env.MCSMP_CHANNEL_ID || '';
+const ANNOUNCEMENT_CHANNEL_ID = process.env.ANNOUNCEMENT_CHANNEL_ID || '1552294940556533870';
+const MCSMP_CHANNEL_ID = process.env.MCSMP_CHANNEL_ID || '1552302848543432794';
 function findAdminSourceChannel(guild, id, regex) {
     const byId = id ? guild.channels.cache.get(id) : null;
     if (byId?.isTextBased()) return byId;
