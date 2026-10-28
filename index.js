@@ -18,15 +18,19 @@ import {
     UserSelectMenuBuilder,
     RoleSelectMenuBuilder,
     ChannelType,
-    Partials
+    Partials,
+    AttachmentBuilder
 } from 'discord.js';
 import http from 'http';
+import zlib from 'zlib';
 
 // ---------------------------------------------------------------------------
 // Configuration (all optional values can be set as Render environment variables)
 // ---------------------------------------------------------------------------
 // Required: DISCORD_TOKEN, GEMINI_API_KEY
-// Optional: GEMINI_MODEL        (default: gemini-flash-latest, the stronger model)
+// Optional: GEMINI_FAST_MODELS  (normal messages: models in order, default gemini-flash-lite-latest, then the previous flash-lite models; found automatically)
+//           GEMINI_THINK_MODELS (think mode for maths/research: models in order, default the newest Flash up to version 3.6, then the two before it; found automatically)
+//           GEMINI_THINK_MAX_VERSION (default 3.6: think mode never uses a Flash model newer than this)
 //           USE_SEARCH          (default: true, lets Gemini use Google Search for live/current info)
 //           AI_CHANNEL_ID       (one or more channel IDs separated by commas, active after every restart)
 //           ALLOWED_MODELS      (models people can pick with /duro-models and /my-duro-models, default: all models that have free quota; list names to show only those, or put them in this variable to override the hiding)
@@ -54,10 +58,16 @@ const WEB_SEARCH_ALWAYS = (process.env.WEB_SEARCH_ALWAYS ?? 'false').toLowerCase
 const FRESH_INFO_PATTERN = /\b(latest|newest|new|current|currently|today|tonight|now|nowadays|recent|recently|news|update|updated|updates|version|release|released|patch|season|price|prices|cost|how many|how much|score|scores|weather|who is|who are|who was|who won|who wins|winner|ranking|rank|ranked|top|best|biggest|largest|richest|most subscribed|most popular|trending|popular|champion|president|prime minister|ceo|stock|worth|net worth|subscribers|followers|population|release date|when does|when is|when did|this (week|month|year)|last (week|month|year)|20(2[4-9]|3\d)|search|google|internet|online|look ?up|check (it|that|this)|outdated|out of date|old (info|data|answer)|wrong|not true)\b/i;
 
 // Model names change often. Aliases like "-latest" avoid your bot breaking when old models are retired.
-const MODEL_CHAIN = [...new Set([
-    process.env.GEMINI_MODEL || 'gemini-flash-latest', // stronger model: follows the conversation and does maths better
-    'gemini-flash-lite-latest'                          // lighter backup if the first one fails or is busy
-])];
+// Two lists, each tried in order. When a model FAILS, the next one in its list is used; the failed one rests 15 minutes and then gets another chance.
+//  - MODEL_CHAIN: normal messages. gemini-flash-lite-latest first (fast), then the previous flash-lite models.
+//  - THINK_CHAIN: "think mode" (calculations, maths, deeper research). The strongest working Flash model up to version 3.6, then the two before it.
+//    (Flash 3.7 and 3.8 are skipped on purpose: they never worked on this API key.)
+const envModelList = name => (process.env[name] || '').split(',').map(id => id.trim()).filter(Boolean);
+const MODEL_CHAIN = [...new Set([...envModelList('GEMINI_FAST_MODELS'), ...(envModelList('GEMINI_FAST_MODELS').length ? [] : ['gemini-flash-lite-latest'])])];
+const THINK_CHAIN = envModelList('GEMINI_THINK_MODELS');   // filled automatically from Google's model list when not set
+const THINK_MAX_VERSION = parseFloat(process.env.GEMINI_THINK_MAX_VERSION || '3.6');
+const MODEL_RETRY_MINUTES = 15;                   // a failed model rests this long, then Duro tries it again first
+const THINK_TIMEOUT_MS = 4 * 60_000;              // think mode may think for a long time; a model is only given up on when it fails or after 4 minutes
 
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const MAX_HISTORY_MESSAGES = 200;         // everything Duro remembers per channel or DM (user + bot messages), kept in memory
@@ -202,6 +212,12 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `with no introduction about what X is and no commentary after the steps. Add a detail only when the steps would fail without it. ` +
     `Never cut a needed explanation short, but never add what was not needed. Only state details you are confident about; if a part is uncertain, say so briefly instead of guessing. ` +
     `Use Discord markdown (bold, bullet lists, short headers only when they help). Reply in the language the person writes in. ` +
+    `FILES: you CAN create files and folders. The bot's code sends them as attachments (several files or any folder become one zip). Never say that you cannot upload, attach or send files. ` +
+    `Whenever the person asks you to code, build, make or write something bigger than a short snippet (a game, a web page, a script, a bot, a program, a project, a long text), or asks for a file, folder or zip, put the work in files, using exactly this format for EACH file: ` +
+    `a line "<<<FILE: path/name.ext>>>", then the complete raw content of the file (no markdown code fence around it), then a line "<<<END>>>". ` +
+    `Use real paths for folders, for example "flappy-bird/index.html", "flappy-bird/style.css", "flappy-bird/js/game.js". If they ask for a text file or only say "file", use a .txt name. ` +
+    `Write complete, working files with no placeholders and no "add your code here". Before the files write at most one short sentence, and after them at most one short sentence about how to run or use it (only if needed). ` +
+    `NEVER paste a file's content into the chat as well. A short snippet (under about 20 lines) with no file request stays in a normal code block. Long non-code writing (essays, long lists, documents) also goes into a file such as notes.txt. ` +
     `You cannot draw or generate pictures; if someone asks you to draw or make an image, say you can only describe things in words. ` +
     `You can look at pictures, PDFs and text/code files that people attach (not GIFs, videos or other file types: if someone sends one of those, say you can't open that type). ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
@@ -481,6 +497,167 @@ async function getWebResults(userText, history) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Files and folders: the AI writes files as <<<FILE: path>>> ... <<<END>>> blocks; the code sends them as attachments (a zip for folders)
+// ---------------------------------------------------------------------------
+const FILE_BLOCK_RE = /<<<FILE:\s*([^\n>]+?)\s*>>>[ \t]*\r?\n([\s\S]*?)(?:\r?\n[ \t]*<<<END>>>|$)/g;   // a missing <<<END>>> (cut-off answer) still gives the file
+const MAX_ANSWER_FILES = 40;
+const MAX_FILES_BYTES = 8 * 1024 * 1024;        // everything one answer sends
+const LONG_ANSWER_CHARS = 3800;                 // a plain answer longer than this (about 2+ messages) is sent as a .txt file
+const BIG_CODE_BLOCK_CHARS = 1200;              // a code block this long is a file, even when the AI forgot the file format
+const CODE_FILE_NAMES = { html: 'index.html', htm: 'index.html', css: 'style.css', js: 'script.js', javascript: 'script.js', mjs: 'script.mjs', ts: 'main.ts', typescript: 'main.ts', jsx: 'App.jsx', tsx: 'App.tsx', py: 'main.py', python: 'main.py', java: 'Main.java', json: 'data.json', sh: 'script.sh', bash: 'script.sh', c: 'main.c', cpp: 'main.cpp', 'c++': 'main.cpp', cs: 'Program.cs', csharp: 'Program.cs', go: 'main.go', rust: 'main.rs', rs: 'main.rs', php: 'index.php', rb: 'main.rb', ruby: 'main.rb', sql: 'query.sql', yaml: 'config.yml', yml: 'config.yml', xml: 'data.xml', md: 'README.md', markdown: 'README.md', lua: 'main.lua', kt: 'Main.kt', kotlin: 'Main.kt', swift: 'main.swift' };
+
+// "a/b/../c.txt" -> safe relative path with no "..", no leading slash, no odd characters
+function cleanFilePath(raw) {
+    const parts = String(raw).replace(/\\/g, '/').split('/')
+        .map(part => part.trim().replace(/[\u0000-\u001f<>:"|?*`]/g, ''))
+        .filter(part => part && part !== '.' && part !== '..');
+    return parts.join('/').slice(0, 120) || 'file.txt';
+}
+
+// Gives every file a unique path, so two files never overwrite each other
+function uniqueFilePaths(files) {
+    const used = new Set();
+    return files.map(file => {
+        let path = cleanFilePath(file.path);
+        if (used.has(path.toLowerCase())) {
+            const dot = path.lastIndexOf('.');
+            const base = dot > path.lastIndexOf('/') ? path.slice(0, dot) : path;
+            const ext = dot > path.lastIndexOf('/') ? path.slice(dot) : '';
+            let n = 2;
+            while (used.has(`${base}-${n}${ext}`.toLowerCase())) n++;
+            path = `${base}-${n}${ext}`;
+        }
+        used.add(path.toLowerCase());
+        return { path, content: file.content };
+    });
+}
+
+// Splits the AI's answer into the chat text and the files it wants to send
+function extractFiles(raw) {
+    let text = String(raw ?? '');
+    let files = [];
+    text = text.replace(FILE_BLOCK_RE, (_, path, content) => {
+        let body = content.replace(/\r\n/g, '\n');
+        const fenced = body.match(/^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$/);   // the AI sometimes wraps the file in a code fence anyway
+        if (fenced) body = fenced[1];
+        files.push({ path, content: body.replace(/\s+$/, '') + '\n' });
+        return '';
+    });
+    text = text.replace(/<<<END>>>/g, '').replace(/\n{3,}/g, '\n\n').trim();
+
+    // The AI forgot the file format: a big code block still becomes a file
+    if (!files.length) {
+        text = text.replace(/```([\w+#-]*)[ \t]*\n([\s\S]*?)\n?```/g, (whole, lang, code) => {
+            if (code.length < BIG_CODE_BLOCK_CHARS) return whole;
+            files.push({ path: CODE_FILE_NAMES[String(lang).toLowerCase()] || (lang ? `code.${String(lang).toLowerCase()}` : 'code.txt'), content: code.replace(/\s+$/, '') + '\n' });
+            return '';
+        }).replace(/\n{3,}/g, '\n\n').trim();
+    }
+    // A very long plain answer is easier to read as a file than as many messages
+    if (!files.length && text.length > LONG_ANSWER_CHARS) {
+        files.push({ path: 'answer.txt', content: text + '\n' });
+        text = '📄 That answer is long, so I put it in a file.';
+    }
+    files = uniqueFilePaths(files.slice(0, MAX_ANSWER_FILES));
+    return { text, files };
+}
+
+const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+function crc32(buffer) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < buffer.length; i++) c = CRC_TABLE[(c ^ buffer[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// A small zip writer (no extra packages needed): files [{ path, content }] -> Buffer
+function makeZip(files) {
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const parts = [];
+    const central = [];
+    let offset = 0;
+    for (const file of files) {
+        const name = Buffer.from(file.path, 'utf8');
+        const data = Buffer.from(file.content, 'utf8');
+        const packed = zlib.deflateRawSync(data);
+        const deflated = packed.length < data.length;
+        const body = deflated ? packed : data;
+        const method = deflated ? 8 : 0;
+        const crc = crc32(data);
+
+        const local = Buffer.alloc(30);
+        local.writeUInt32LE(0x04034b50, 0);
+        local.writeUInt16LE(20, 4);
+        local.writeUInt16LE(0x0800, 6);       // file names are UTF-8
+        local.writeUInt16LE(method, 8);
+        local.writeUInt16LE(dosTime, 10);
+        local.writeUInt16LE(dosDate, 12);
+        local.writeUInt32LE(crc, 14);
+        local.writeUInt32LE(body.length, 18);
+        local.writeUInt32LE(data.length, 22);
+        local.writeUInt16LE(name.length, 26);
+        parts.push(local, name, body);
+
+        const entry = Buffer.alloc(46);
+        entry.writeUInt32LE(0x02014b50, 0);
+        entry.writeUInt16LE(20, 4);
+        entry.writeUInt16LE(20, 6);
+        entry.writeUInt16LE(0x0800, 8);
+        entry.writeUInt16LE(method, 10);
+        entry.writeUInt16LE(dosTime, 12);
+        entry.writeUInt16LE(dosDate, 14);
+        entry.writeUInt32LE(crc, 16);
+        entry.writeUInt32LE(body.length, 20);
+        entry.writeUInt32LE(data.length, 24);
+        entry.writeUInt16LE(name.length, 28);
+        entry.writeUInt32LE(offset, 42);
+        central.push(entry, name);
+        offset += 30 + name.length + body.length;
+    }
+    const centralBuffer = Buffer.concat(central);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50, 0);
+    end.writeUInt16LE(files.length, 8);
+    end.writeUInt16LE(files.length, 10);
+    end.writeUInt32LE(centralBuffer.length, 12);
+    end.writeUInt32LE(offset, 16);
+    return Buffer.concat([...parts, centralBuffer, end]);
+}
+
+// Turns the extracted files into Discord attachments: one flat file (or up to 3) as they are, folders or many files as one zip
+function buildFileAttachments(files) {
+    if (!files.length) return [];
+    const total = files.reduce((sum, file) => sum + Buffer.byteLength(file.content), 0);
+    if (total > MAX_FILES_BYTES) return [];
+    const hasFolder = files.some(file => file.path.includes('/'));
+    if (!hasFolder && files.length <= 3) {
+        return files.map(file => new AttachmentBuilder(Buffer.from(file.content, 'utf8'), { name: file.path }));
+    }
+    const tops = new Set(files.map(file => file.path.split('/')[0]));
+    const zipName = (hasFolder && tops.size === 1 ? [...tops][0] : 'duro-files').replace(/\.[^.]*$/, '').slice(0, 60) || 'duro-files';
+    return [new AttachmentBuilder(makeZip(files), { name: `${zipName}.zip` })];
+}
+
+// The chat text pieces and the attachments to send for one answer
+function prepareAnswer({ text, files }) {
+    const attachments = buildFileAttachments(files || []);
+    let body = text;
+    if (files?.length && !attachments.length) body = `${body}\n\n⚠️ The files were too big to send (the limit is 8 MB).`.trim();
+    if (!body && attachments.length) body = '📎 Here you go.';
+    const chunks = splitMessage(body || '…');
+    return { chunks, attachments };
+}
+
 // Split long text into Discord-sized pieces, preferring line/word boundaries
 function splitMessage(text, max = DISCORD_CHUNK_SIZE) {
     const chunks = [];
@@ -566,13 +743,13 @@ async function buildAttachmentParts(attachments) {
 }
 
 // One request to the Gemini API for a specific model
-async function requestGemini(model, contents, withSearch, hasWebResults, senderRole, notesText = '') {
+async function requestGemini(model, contents, withSearch, hasWebResults, senderRole, notesText = '', timeoutMs = 0) {
     const body = {
         systemInstruction: { parts: [{ text: buildSystemInstruction(withSearch, hasWebResults, model, senderRole, notesText) }] },
         contents,
         generationConfig: {
             temperature: 0.7,
-            maxOutputTokens: 4096
+            maxOutputTokens: 16384
         }
     };
     if (withSearch) body.tools = [{ googleSearch: {} }];
@@ -584,7 +761,7 @@ async function requestGemini(model, contents, withSearch, hasWebResults, senderR
             'x-goog-api-key': GEMINI_API_KEY // key in a header, not in the URL, so it never leaks into logs
         },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(contents.some(entry => entry.parts?.some(part => part.inlineData)) ? REQUEST_TIMEOUT_MS : TEXT_REQUEST_TIMEOUT_MS)
+        signal: AbortSignal.timeout(timeoutMs || (contents.some(entry => entry.parts?.some(part => part.inlineData)) ? REQUEST_TIMEOUT_MS : TEXT_REQUEST_TIMEOUT_MS))
     });
 
     const raw = await response.text();
@@ -602,30 +779,72 @@ async function requestGemini(model, contents, withSearch, hasWebResults, senderR
     return data;
 }
 
-// Tries search first, then no search, then the fallback model
-// If Google is overloaded (503/500) or too slow, wait a few seconds and run the whole model list one more time
+// Tries the models of the right list in order (think mode or normal). A model that fails rests and the next one answers.
 async function askGemini(...args) {
-    try {
-        return await askGeminiOnce(...args);
-    } catch (err) {
-        const overloaded = err?.status === 503 || err?.status === 500 || err?.name === 'TimeoutError' || err?.name === 'AbortError';
-        if (!overloaded) throw err;
-        console.warn('Google is overloaded or slow, trying once more in 4 seconds...');
-        await new Promise(resolve => setTimeout(resolve, 4000));
-        return await askGeminiOnce(...args);
-    }
+    return await askGeminiOnce(...args);
 }
 
-async function askGeminiOnce(contents, channelId, userId, hasWebResults = false, senderRole = 'member', notesText = '') {
+// Work out the model lists from Google's list of models (every 10 minutes at most)
+let chainsCheckedAt = 0;
+const modelVersion = id => {
+    const m = id.match(/gemini-(\d+(?:\.\d+)?)/) || id.match(/(\d+(?:\.\d+)?)/);
+    return m ? parseFloat(m[1]) : 0;
+};
+// one id per version (the shortest name, so "-preview" copies lose), newest version first
+function idsByVersion(ids) {
+    const best = new Map();
+    for (const id of ids) {
+        const v = modelVersion(id);
+        if (!best.has(v) || id.length < best.get(v).length) best.set(v, id);
+    }
+    return [...best.entries()].sort((x, y) => y[0] - x[0]).map(entry => entry[1]);
+}
+async function refreshModelChains(force = false) {
+    if (!force && Date.now() - chainsCheckedAt < 10 * 60_000) return;
+    chainsCheckedAt = Date.now();
+    let ids;
+    try {
+        ids = (await getAvailableModels()).map(m => m.id);
+    } catch (err) {
+        console.warn('Could not read the model list, keeping the current model lists:', err.message);
+        chainsCheckedAt = Date.now() - 9 * 60_000;   // try again in about a minute
+        return;
+    }
+    if (!envModelList('GEMINI_FAST_MODELS').length) {
+        const lite = idsByVersion(ids.filter(id => /flash.*lite|lite.*flash/i.test(id) && !/latest/i.test(id)));
+        // the "-latest" alias already points to the newest flash-lite, so the models after it are the previous ones
+        MODEL_CHAIN.splice(0, MODEL_CHAIN.length, 'gemini-flash-lite-latest', ...lite.slice(1, 3));
+    }
+    if (!envModelList('GEMINI_THINK_MODELS').length) {
+        const flash = idsByVersion(ids.filter(id => /flash/i.test(id) && !/lite/i.test(id) && !/latest/i.test(id) && modelVersion(id) <= THINK_MAX_VERSION));
+        THINK_CHAIN.splice(0, THINK_CHAIN.length, ...flash.slice(0, 3));
+    }
+    console.log(`Model lists: normal = ${MODEL_CHAIN.join(' -> ')} | think mode = ${THINK_CHAIN.join(' -> ') || '(none found, normal models are used)'}`);
+}
+
+// Calculations, maths and deeper research use "think mode"
+const THINK_PATTERN = /\b(calculate|calculation|calculations|compute|solve|equation|equations|formula|integral|derivative|algebra|geometry|trigonometry|probability|percentage|percent|average|square root|cube root|factorial|prime numbers?|logarithm|sum of|how many (?:ways|combinations|possible)|prove|proof|step by step|research|analy[sz]e|analysis|in[- ]depth|deep dive|pros and cons|compare|comparison|strategy|optimi[sz]e|algorithm|debug|write (?:a |me a )?(?:code|script|program|function))\b/i;
+const MATH_EXPRESSION = /\d\s*[+*\/^×÷]\s*\d|\d\s+[-x]\s+\d|\bsqrt\b|\d\s*(?:%|\^)/i;
+// Asking for code, a project, or a file / folder / zip: big outputs, so they also use think mode (stronger model, long timeout)
+const FILE_REQUEST_PATTERN = /\b(zip|folders?|\.txt|\.html|\.py|\.js|(?:in|as|into) (?:a |an )?(?:txt |text )?files?|text file|file format|give (?:me )?(?:a )?files?)\b|\b(code|coding|make|build|create|write|generate|develop|program)\b[^.?!]{0,60}\b(game|app|website|web ?site|web ?page|page|script|bot|program|project|plugin|mod|tool|calculator|extension|html|css|javascript|python|java|api|server|code|essay|story|report)\b/i;
+function needsThinking(text) {
+    const t = String(text || '');
+    return THINK_PATTERN.test(t) || MATH_EXPRESSION.test(t) || FILE_REQUEST_PATTERN.test(t) || t.length > 450;
+}
+
+async function askGeminiOnce(contents, channelId, userId, hasWebResults = false, senderRole = 'member', notesText = '', think = false) {
     let lastError;
     const startedAt = Date.now();
+    await refreshModelChains().catch(() => {});
 
-    // Priority: the user's personal model, then the channel model, then the default models as backups.
-    // Models that just hit their limit (or are overloaded) rest for a while and are skipped, so answers don't wait on them.
+    // Priority: the user's personal model, then the channel model, then the models of the right list (think mode or normal).
+    // A model that fails rests 15 minutes and is skipped, so answers don't wait on it; after that it is the first choice again.
+    const primaryChain = think && THINK_CHAIN.length ? THINK_CHAIN : MODEL_CHAIN;
+    const otherChain = primaryChain === THINK_CHAIN ? MODEL_CHAIN : THINK_CHAIN;
     const preferred = [...new Set([
         userModels.get(userId),
         channelModels.get(channelId),
-        ...MODEL_CHAIN
+        ...primaryChain
     ].filter(Boolean))];
     let ready = preferred.filter(model => !isResting(model));
     // Pictures, PDFs and files are slow with the stronger model: use the light model first (unless someone chose a model on purpose)
@@ -646,7 +865,8 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
 
         for (const withSearch of attempts) {
             try {
-                const data = await requestGemini(model, contents, withSearch, hasWebResults, senderRole, notesText);
+                // Think mode: the thinking models may take long, so they are only given up on when they really fail (or after 4 minutes)
+                const data = await requestGemini(model, contents, withSearch, hasWebResults, senderRole, notesText, think && THINK_CHAIN.includes(model) ? THINK_TIMEOUT_MS : 0);
 
                 if (data.promptFeedback?.blockReason) {
                     return "⚠️ I can't answer that one (it was blocked by safety filters).";
@@ -698,19 +918,15 @@ async function askGeminiOnce(contents, channelId, userId, hasWebResults = false,
     let answer = ready.length ? await attemptModels(ready) : undefined;
     if (answer !== undefined) return answer;
 
-    // 2) every other text model that has free quota on this API key, one after another
-    const fallbacks = (await getAvailableModels().catch(() => []))
-        .map(m => m.id)
-        .filter(id => !tried.has(id) && !isResting(id) && !preferred.includes(id))
-        .sort((a, b) => fallbackRank(a) - fallbackRank(b))
-        .slice(0, 4);
-    if (fallbacks.length) {
-        console.warn(`Switching to other available models: ${fallbacks.join(', ')}`);
-        answer = await attemptModels(fallbacks);
+    // 2) the other list (for example the normal models when every think-mode model failed)
+    const others = otherChain.filter(id => !tried.has(id) && !isResting(id));
+    if (others.length) {
+        console.warn(`Switching to the other model list: ${others.join(', ')}`);
+        answer = await attemptModels(others);
         if (answer !== undefined) return answer;
     }
 
-    // 3) last chance: the resting models (a limit may have reset since)
+    // 3) last chance: the resting models of this list (a limit may have reset since)
     const resting = preferred.filter(model => !tried.has(model));
     if (resting.length) {
         answer = await attemptModels(resting);
@@ -731,14 +947,10 @@ const modelFailStreak = new Map(); // model id -> failures in a row (reset when 
 function restModel(model, err) {
     let minutes = 0;
     if (err.status === 429) {
-        // "per day" limits last long; per-minute limits are over quickly
-        minutes = /per ?day|daily|PerDay/i.test(err.message) || /limit: 0/i.test(err.message) ? 60 : 1.5;
-    } else if (err.status === 500 || err.status === 503 || err.name === 'TimeoutError' || err.name === 'AbortError') {
-        const streak = (modelFailStreak.get(model) ?? 0) + 1;
-        modelFailStreak.set(model, streak);
-        minutes = Math.min(5 * 3 ** (streak - 1), 180); // busy or slow: rest 5, 15, 45, 135, then 180 minutes while it keeps failing
-    } else if (err.status === 404) {
-        minutes = 360;
+        // a per-minute limit is over quickly; any other limit rests like a failure
+        minutes = /per ?day|daily|PerDay/i.test(err.message) || /limit: 0/i.test(err.message) ? MODEL_RETRY_MINUTES : 1.5;
+    } else if (err.status === 500 || err.status === 503 || err.status === 404 || err.name === 'TimeoutError' || err.name === 'AbortError') {
+        minutes = MODEL_RETRY_MINUTES;   // failed, busy, slow or gone: the next model answers; this one gets another chance after 15 minutes
     }
     if (minutes) {
         modelRestUntil.set(model, Date.now() + minutes * 60_000);
@@ -758,7 +970,7 @@ function friendlyErrorMessage(err) {
         if (err.status === 503 || err.status === 500) return '🌐 Google\'s AI is overloaded right now (not a problem on my side). Please ask again in a minute.';
         if (err.status === 429) return '⏳ I\'m getting too many requests right now. Please try again in a minute.';
         if (err.status === 401 || err.status === 403) return '🔑 My Gemini API key was rejected. The server owner needs to check it.';
-        if (err.status === 404) return '🛠️ The AI model I\'m set to use is no longer available. The server owner needs to update GEMINI_MODEL.';
+        if (err.status === 404) return '🛠️ The AI models I use are not available right now. The server owner needs to check the model names.';
     }
     if (err?.name === 'TimeoutError' || err?.name === 'AbortError') return '⌛ That took too long. Please try again.';
     return '⚠️ Something went wrong while thinking about that. Please try again.';
@@ -923,7 +1135,7 @@ function getNumberCompareNote(userText) {
 }
 
 async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null, extraNote = '' }) {
-    if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return REFUSAL_TEXT;
+    if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return { text: REFUSAL_TEXT, files: [] };
 
     // The role tag is added by the code from Discord's data, so the AI can tell who is really an admin
     const promptText = `${author} [${senderRole}]: ${userText}`;
@@ -958,13 +1170,19 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     const dmText = isDm ? [dmContext, getDmPromptsText(userId)].filter(Boolean).join('\n') : '';
     const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText, extraNote].filter(Boolean).join('\n');
 
-    let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText);
+    // Calculations and deeper research use think mode (stronger model, no short timeout); pictures/files and code-checked comparisons stay fast
+    const think = !compareNote && !imageParts.length && needsThinking(userText);
+    let answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText, think);
 
     const askedUserIds = new Set([...`${userText} ${extraNote}`.matchAll(/<@!?(\d+)>/g)].map(m => m[1]));   // people and roles the asker mentioned may be shown as clickable names (no ping)
     const askedRoleIds = new Set([...userText.matchAll(/<@&(\d+)>/g)].map(m => m[1]));
     const shownUserIds = new Set([...linkedMemberIds(), ...askedUserIds]);
     const shownRoleIds = new Set([...linkedRoleIds(), ...askedRoleIds]);
-    answer = linkChannelNames(linkSeenMembers(linkRoleNames(linkMemberNames(removeMentionCodes(answer, shownUserIds, shownRoleIds), linkedMemberIds()), linkedRoleIds())), guild) || REFUSAL_TEXT;
+    // Files are taken out first, so the code inside them is never touched by the name/channel linking
+    const rawAnswer = answer;
+    const extracted = extractFiles(answer);
+    const files = extracted.files;
+    answer = linkChannelNames(linkSeenMembers(linkRoleNames(linkMemberNames(removeMentionCodes(extracted.text, shownUserIds, shownRoleIds), linkedMemberIds()), linkedRoleIds())), guild) || (files.length ? '' : REFUSAL_TEXT);
 
     // Safety net: remove a leading "Name:" or "Name [role]:" if the model still copies the prefix
     for (const prefix of [`${author} [${senderRole}]:`, `${author}:`]) {
@@ -973,9 +1191,10 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
 
     // Only remember the exchange if it worked
     addToHistory(channelId, 'user', imageParts.length ? `${promptText} [attached ${imageParts.length} file(s)]` : promptText);
-    addToHistory(channelId, 'model', answer);
+    // The files stay in the memory (cut at 20,000 characters), so "change the colour" or "fix the bug" works on what Duro just made
+    addToHistory(channelId, 'model', files.length ? rawAnswer.slice(0, 20_000) : answer);
 
-    return answer;
+    return { text: answer, files };
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,6 +1954,7 @@ async function handlePromptList(interaction) {
 // ---------------------------------------------------------------------------
 client.once(Events.ClientReady, async () => {
     console.log(`Duro AI is online as ${client.user.tag}! Models: ${MODEL_CHAIN.join(' -> ')}`);
+    refreshModelChains(true).catch(() => {});
     await loadPromptStore(); // read the saved prompts back from their hidden channel
 
     const slashCommands = [
@@ -2871,15 +3091,15 @@ async function handleDirectMessage(message) {
             senderRole: getSenderRole(message.author, member.permissions, guild),
             guild
         });
-        const chunks = splitMessage(answer);
+        const { chunks, attachments } = prepareAnswer(answer);
         if (DM_LOG_ALL && !dmNoticeSent.has(message.author.id)) {
             dmNoticeSent.add(message.author.id);
             chunks[chunks.length - 1] += '\n\n*Note: the server owner reviews private chats with me to improve me.*';
         }
-        await message.reply({ content: chunks[0], allowedMentions: { parse: [] } });
+        await message.reply({ content: chunks[0], files: attachments, allowedMentions: { parse: [] } });
         for (const chunk of chunks.slice(1)) await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
         // Duro's answer in a DM that an admin started is copied to the mod-log channel too
-        if (watchedDm) sendModLog(`📤 Duro answered <@${message.author.id}>:\n> ${answer.slice(0, 600).replace(/\n/g, '\n> ')}`).catch(() => {});
+        if (watchedDm) sendModLog(`📤 Duro answered <@${message.author.id}>:\n> ${(answer.text + (answer.files.length ? `\n[sent ${answer.files.map(f => f.path).join(', ')}]` : '')).slice(0, 600).replace(/\n/g, '\n> ')}`).catch(() => {});
     } catch (error) {
         console.error('DM handling error:', error);
         await message.reply({ content: friendlyErrorMessage(error), allowedMentions: { parse: [] } }).catch(() => {});
@@ -3107,11 +3327,11 @@ client.on(Events.MessageCreate, async (message) => {
         });
         if (watched) watch.uses++;
 
-        const chunks = splitMessage(answer);
+        const { chunks, attachments } = prepareAnswer(answer);
         // allowedMentions stops the AI from pinging @everyone / roles / users by accident
         const safeMentions = { parse: [], repliedUser: false };
 
-        await message.reply({ content: chunks[0], allowedMentions: safeMentions });
+        await message.reply({ content: chunks[0], files: attachments, allowedMentions: safeMentions });
         duroSpokeTo.set(`${message.channel.id}:${message.author.id}`, Date.now());
         for (const chunk of chunks.slice(1)) {
             await message.channel.send({ content: chunk, allowedMentions: safeMentions });
