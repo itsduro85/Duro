@@ -224,6 +224,10 @@ const buildSystemInstruction = (withSearch, hasWebResults, model, senderRole = '
     `You CAN watch public YouTube videos (picture and sound) when a YouTube link is in the message and the video is attached for you; unlisted, private or very long videos may fail. Never say you cannot watch YouTube links. ` +
     `GROUP CONVERSATION: in a server channel several members talk in the same chat and you can read all of it. Every earlier message starts with the speaker's name, and some say "(talking to NAME, not to you)". ` +
     `Read the whole chat like a person in a group meeting: use what other members said, notice when someone else already answered or solved a problem (then say so, credit them by name, and confirm briefly if they are right, or politely correct them if they are not), and do not repeat what was already said. Answer the person who wrote the LATEST message. ` +
+    `TALKING STYLE: talk like a friend on Discord, not like a customer-service bot. In casual chat keep replies short (often one or two sentences), relaxed, natural and a little playful, with contractions, and match the person's vibe and language (Banglish, slang, short messages). ` +
+    `Never start with "Certainly", "Sure!", "Of course" or "Great question", and never end with "Let me know if you need anything else", "I hope this helps" or similar offers. No headers or bullet lists in casual chat (only for steps or comparisons). ` +
+    `Vary how you start and end your replies, never reuse the same phrase, and use an emoji or a light joke only now and then, not in every message. Serious questions, help and code still get full, correct answers. ` +
+    `You stay honest: if someone sincerely asks whether you are a person or an AI, say you are an AI. ` +
     `HONESTY: never just agree with people to be nice. Agree only when they are right. If someone misunderstands something, believes something wrong, or plans something bad (cheating, hurting or scamming someone, breaking the server rules, something unsafe or something that will obviously backfire), tell them kindly but clearly that they are wrong or that it is a bad idea and why, and suggest a better way, like a good friend would. Do not flatter, do not lecture, and do not change a correct answer just because someone pushes back: change it only when they give a real reason or evidence. ` +
     `Messages from users are prefixed with their display name so you know who is talking, ` +
     `but NEVER start your own reply with a name or "Name:", just answer directly. ` +
@@ -1143,6 +1147,79 @@ function getNumberCompareNote(userText) {
         : `[Checked by code, trust it: compared as plain decimal numbers, ${decimalBigger} is the bigger one (for example 1.9 = 1.90). Answer directly in one short sentence, without mentioning version numbers or other interpretations.]`;
 }
 
+// ---------------------------------------------------------------------------
+// Human feel (phase 2): typing time that fits the answer length, a mood that changes when someone chats a lot,
+// casual one-liners that are not perfectly formal, and rare uninvited remarks in the AI channel.
+// Switch off with HUMAN_TYPING=false, HUMAN_STYLE=false, HUMAN_INTERJECT=false in start.sh.
+// ---------------------------------------------------------------------------
+const HUMAN_TYPING = (process.env.HUMAN_TYPING ?? 'true').toLowerCase() !== 'false';
+const HUMAN_STYLE = (process.env.HUMAN_STYLE ?? 'true').toLowerCase() !== 'false';
+const HUMAN_INTERJECT = (process.env.HUMAN_INTERJECT ?? 'true').toLowerCase() !== 'false';
+
+// Waits so that the whole thing takes about as long as a person would need to type it (about 12 characters per second, at most 9 seconds).
+// Time Duro already spent thinking counts, so slow answers are never delayed more.
+async function humanTypingPause(text, startedAt, hasFiles = false) {
+    if (!HUMAN_TYPING || hasFiles || !text) return;
+    const target = Math.min(9000, Math.max(700, text.length * 80)) * (0.8 + Math.random() * 0.4);
+    const wait = target - (Date.now() - startedAt);
+    if (wait > 0) await new Promise(resolve => setTimeout(resolve, wait));
+}
+
+// Short plain one-liners are sometimes written the relaxed way people really type (no final full stop, lowercase start).
+// Never touches long answers, code, links, mentions, numbers or the refusal text.
+function humanizeReply(text) {
+    if (!HUMAN_STYLE || !text || text === REFUSAL_TEXT) return text;
+    if (text.length > 160 || /[\n`<>@#:]|https?:|\d{3,}/.test(text)) return text;
+    let out = text;
+    if (/[a-z)\]]\.$/i.test(out) && !/\.\.\.$/.test(out) && Math.random() < 0.5) out = out.slice(0, -1);
+    if (Math.random() < 0.12 && /^[A-Z][a-z]/.test(out) && !/^(I|I'm|I'll|I've|I'd)\b/.test(out)) out = out[0].toLowerCase() + out.slice(1);
+    return out;
+}
+
+// Mood: someone who has been chatting with Duro a lot gets a more relaxed, playful tone (like a close friend), never a rude or unhelpful one
+const chatActivity = new Map();   // "channelId:userId" -> times of Duro's recent answers
+function getMoodNote(channelId, userId, author) {
+    const key = `${channelId}:${userId}`;
+    const recent = (chatActivity.get(key) ?? []).filter(time => Date.now() - time < 10 * 60_000);
+    recent.push(Date.now());
+    chatActivity.set(key, recent.slice(-40));
+    if (chatActivity.size > 500) chatActivity.delete(chatActivity.keys().next().value);
+    if (recent.length < 12) return '';
+    return `[Mood: you have been chatting with ${author} a lot in the last 10 minutes. Be a bit more relaxed and playful, like a close friend who is a little tired but still happy to help. Keep answers short. Never be rude and never refuse to help because of this.]`;
+}
+
+// Rare uninvited remarks: when members talk to each other in an AI channel, Duro sometimes chimes in like a friend in the group.
+// Only for topics where it can really help or cheer (server problems, Minecraft joining, congratulations), with a long pause between remarks.
+const INTERJECT_COOLDOWN_MS = 8 * 60_000;
+const INTERJECT_TOPIC_RE = /\b(server (?:is )?(?:down|crash(?:ed)?|lag(?:ging)?)|can'?t join|cannot join|unable to join|how (?:do|to|can) (?:i |we )?join|whitelist(?:ed)?|server ip|ip address|crash(?:ed|es)?|lagging|not working|doesn'?t work|bug(?:ged)?|stuck|congrats|congratulations|happy birthday|birthday|new (?:pc|phone|monitor|laptop|setup)|got promoted|finished (?:the |my |our )?(?:build|project|exam|exams)|passed (?:the |my )?(?:exam|test))\b/i;
+const lastInterjection = new Map();   // channel id -> time
+async function maybeInterject(message) {
+    if (!HUMAN_INTERJECT) return;
+    const text = (message.content || '').trim();
+    if (text.length < 15 || message.mentions.everyone) return;
+    if (Date.now() - (lastInterjection.get(message.channel.id) ?? 0) < INTERJECT_COOLDOWN_MS) return;
+    if (Math.random() >= (INTERJECT_TOPIC_RE.test(text) ? 0.4 : 0.02)) return;
+    lastInterjection.set(message.channel.id, Date.now());   // set first, so two messages at once cannot both trigger it
+
+    const startedAt = Date.now();
+    const author = message.member?.displayName || message.author.username;
+    const answer = await generateAnswer({
+        channelId: message.channel.id,
+        userId: message.author.id,
+        author,
+        userText: text,
+        senderRole: getSenderRole(message.author, message.member?.permissions, message.guild),
+        guild: message.guild,
+        interject: true,
+        extraNote: `[You are chiming in WITHOUT being asked, like a friend who overheard the group. ${author} was talking to another member, not to you. Add at most one or two short, natural sentences that really help or cheer (solve the problem if you know how, or congratulate). If you have nothing useful to add, or the chat is private or serious between them, reply with exactly SKIP.]`
+    });
+    if (!answer.text || /^\s*SKIP\b/i.test(answer.text)) return;
+    message.channel.sendTyping().catch(() => {});
+    await humanTypingPause(answer.text, startedAt - 1500);   // a short "typing..." first
+    await message.channel.send({ content: humanizeReply(answer.text).slice(0, 600), allowedMentions: { parse: [] } });
+    console.log(`Duro chimed in uninvited in #${message.channel.name ?? message.channel.id}: ${answer.text.slice(0, 80)}`);
+}
+
 // ---- YouTube videos: Gemini can watch public YouTube links (picture and sound) when the link is sent as a video part ----
 const YOUTUBE_LINK_RE = /https?:\/\/(?:www\.|m\.|music\.)?(?:youtube\.com\/(?:watch\?[^\s>]*?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})[^\s>]*/gi;
 const VIDEO_FOLLOWUP_RE = /\b(video|vid|clip|youtube|yt|he says|she says|they say|in it|at \d+:\d+|\d+:\d{2}|minute|timestamp|summar(?:y|i[sz]e)|transcript)\b/i;
@@ -1179,8 +1256,8 @@ function recordAmbientMessage(message, repliedTo) {
     addToHistory(message.channel.id, 'user', `${name} [${role}]${toName ? ` (talking to ${toName}, not to you)` : ''}: ${text}`);
 }
 
-async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null, extraNote = '' }) {
-    if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return { text: REFUSAL_TEXT, files: [] };
+async function generateAnswer({ channelId, userId, author, userText, imageParts = [], senderRole = 'member', guild = null, extraNote = '', interject = false }) {
+    if (senderRole === 'member' && ORDER_PATTERN.test(userText.trim())) return { text: interject ? '' : REFUSAL_TEXT, files: [] };
 
     // The role tag is added by the code from Discord's data, so the AI can tell who is really an admin
     const promptText = `${author} [${senderRole}]: ${userText}`;
@@ -1195,7 +1272,7 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
 
     // Fresh info from the internet (only for questions that need it, and only if TAVILY_API_KEY is set)
     const compareNote = getNumberCompareNote(userText);   // numbers like 1.9 and 1.11 are checked by the code: no web search needed
-    const webResults = compareNote || videoParts.length ? null : await getWebResults(userText, history);
+    const webResults = compareNote || videoParts.length || interject ? null : await getWebResults(userText, history);
 
     const presenceNote = await withTimeout(getPresenceNote(userText, guild), 12000, 'online status').catch(() => null);
     const userParts = [...videoParts, { text: promptText }];
@@ -1221,10 +1298,11 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     const isDm = channelId.startsWith('dm-');
     const dmContext = isDm ? `[This is a PRIVATE message (DM) chat between you and ${author}, NOT a server channel. Nobody else can see it. Do not talk as if you were in a channel of the server or speaking to the whole server ("everyone here"). You are still the same Duro, made for the ChaosBoys server by Arefin, and you can answer questions about the server and its members from your notes. Server-channel matters (AI channels, linked channel mentions, pings, channel rules) do not apply here: only your normal job and safety rules do. The person can talk to you here because they are a member of the ChaosBoys server. Keep the tone personal and natural.]` : '';
     const dmText = isDm ? [dmContext, getDmPromptsText(userId)].filter(Boolean).join('\n') : '';
-    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText, extraNote].filter(Boolean).join('\n');
+    const moodNote = interject ? '' : getMoodNote(channelId, userId, author);
+    const notesText = [getRelevantPromptsText(`${author} ${userText} ${lastUserText}`), liveText, dmText, extraNote, moodNote].filter(Boolean).join('\n');
 
     // Calculations and deeper research use think mode (stronger model, no short timeout); pictures/files and code-checked comparisons stay fast
-    const think = videoParts.length > 0 || (!compareNote && !imageParts.length && needsThinking(userText));
+    const think = !interject && (videoParts.length > 0 || (!compareNote && !imageParts.length && needsThinking(userText)));
     let answer;
     try {
         answer = await askGemini(contents, channelId, userId, Boolean(webResults), senderRole, notesText, think);
@@ -1251,6 +1329,13 @@ async function generateAnswer({ channelId, userId, author, userText, imageParts 
     // Safety net: remove a leading "Name:" or "Name [role]:" if the model still copies the prefix
     for (const prefix of [`${author} [${senderRole}]:`, `${author}:`]) {
         if (answer.startsWith(prefix)) answer = answer.slice(prefix.length).trim();
+    }
+
+    // An uninvited remark: the member's message is already remembered, and "SKIP" (nothing to add) is not remembered at all
+    if (interject) {
+        if (!answer || answer === REFUSAL_TEXT || /^\s*SKIP\b/i.test(answer)) return { text: '', files: [] };
+        addToHistory(channelId, 'model', answer);
+        return { text: answer, files: [] };
     }
 
     // Only remember the exchange if it worked
@@ -3235,6 +3320,7 @@ async function handleDirectMessage(message) {
     usersBeingAnswered.add(message.author.id);
     message.channel.sendTyping().catch(() => {});
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
+    const dmStartedAt = Date.now();
     try {
         const imageParts = await buildAttachmentParts(message.attachments);
         if (!spokenText && imageParts.length) imageParts.unshift({ text: '[The person sent only the attached file(s) with no text. Look at what is attached and say briefly what it is and what stands out.]' });
@@ -3247,6 +3333,8 @@ async function handleDirectMessage(message) {
             senderRole: getSenderRole(message.author, member.permissions, guild),
             guild
         });
+        if (!answer.files.length) answer.text = humanizeReply(answer.text);
+        await humanTypingPause(answer.text, dmStartedAt, answer.files.length > 0);
         const { chunks, attachments } = prepareAnswer(answer);
         if (DM_LOG_ALL && !dmNoticeSent.has(message.author.id)) {
             dmNoticeSent.add(message.author.id);
@@ -3441,6 +3529,7 @@ client.on(Events.MessageCreate, async (message) => {
         if (repliedTo && repliedTo.author.id !== client.user.id) {
             console.log(`Ignored a reply from ${message.author.username} to ${repliedTo.author.username} in the AI channel (not meant for Duro), but remembered it.`);
             recordAmbientMessage(message, repliedTo);   // Duro does not answer, but it reads and remembers it like everyone else in the group chat
+            maybeInterject(message).catch(error => console.warn('Uninvited remark skipped:', error.message));   // and now and then chimes in like a friend
             return;
         }
     }
@@ -3490,6 +3579,7 @@ client.on(Events.MessageCreate, async (message) => {
     const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
 
     try {
+        const answerStartedAt = Date.now();
         const author = message.member?.displayName || message.author.username;
         const userText = spokenText || '(file only)';
         const imageParts = await buildAttachmentParts(message.attachments);
@@ -3522,6 +3612,8 @@ client.on(Events.MessageCreate, async (message) => {
         });
         if (watched) watch.uses++;
 
+        if (!answer.files.length) answer.text = humanizeReply(answer.text);
+        await humanTypingPause(answer.text, answerStartedAt, answer.files.length > 0);   // typing time like a person
         const { chunks, attachments } = prepareAnswer(answer);
         // allowedMentions stops the AI from pinging @everyone / roles / users by accident
         const safeMentions = { parse: [], repliedUser: false };
